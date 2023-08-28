@@ -13,25 +13,27 @@ static const int sidepad            = 15;       /* horizontal padding of bar */
 static const char *fonts[]          = { "Hack Nerd Font:pixelsize=15:antialias=true:autohint=true" };
 static const char dmenufont[]       = "Hack Nerd Font:pixelsize=15:antialias=true:autohint=true";
 
-/* static const char normfgcolor[] = "#dda4a9"; */
-/* static const char normbgcolor[] = "#0b0a18"; */
-/* static const char normbordercolor[] = "#9a7276"; */
 
-/* static const char selfgcolor[] = "#dda4a9"; */
-/* static const char selbgcolor[] = "#5A475F"; */
-/* static const char selbordercolor[] = "#dda4a9"; */
 
-/* static const char urg_fg[] = "#dda4a9"; */
-/* static const char urg_bg[] = "#5D284F"; */
-/* static const char urg_border[] = "#5D284F"; */
+/* Red flavour colors */
 
-static char normfgcolor[]                = "#bbbbbb";
-static char normbgcolor[]                = "#0d0303";
-static char normbordercolor[]            = "#444444";
+/* static char normfgcolor[]                = "#bbbbbb"; */
+/* static char normbgcolor[]                = "#0d0303"; */
+/* static char normbordercolor[]            = "#444444"; */
 
-static char selfgcolor[]                 = "#eeeeee";
-static char selbgcolor[]                 = "#911d29";
-static char selbordercolor[]             = "#911d29";
+/* static char selfgcolor[]                 = "#eeeeee"; */
+/* static char selbgcolor[]                 = "#911d29"; */
+/* static char selbordercolor[]             = "#911d29"; */
+
+/* Purple flavour colors */
+
+static char normfgcolor[]                   = "#bbbbbb";
+static char normbgcolor[]                   = "#1d0b26";
+static char normbordercolor[]               = "#444444";
+
+static char selfgcolor[]                    = "#eeeeee";
+static char selbgcolor[]                    = "#962f8b";
+static char selbordercolor[]                = "#962f8b";
 
 static const unsigned int baralpha = 0xd0;
 static const unsigned int borderalpha = OPAQUE;
