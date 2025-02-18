@@ -159,7 +159,7 @@ static const Key keys[] = {
 	{ 0, XF86XK_Search, 		spawn, SHCMD("$BROWSER") },
 	{ 0, XK_Print,                  spawn, SHCMD("/usr/bin/maim -u | xclip -selection clipboard -t image/png; xclip -out -selection clipboard > ~/Pictures/Screenshots/$(date '+%F-%H-%M-%S').png")},
 	{ ShiftMask, XK_Print,          spawn, SHCMD("/usr/bin/maim -su | xclip -selection clipboard -t image/png; xclip -out -selection clipboard > ~/Pictures/Screenshots/$(date '+%F-%H-%M-%S').png")},
-
+	{ ShiftMask, XK_Escape,          spawn, SHCMD("~/.local/bin/change_keyboard_layout.sh")},
 
 };
 
