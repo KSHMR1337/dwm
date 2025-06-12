@@ -109,6 +109,7 @@ static const Key keys[] = {
 	{ MODKEY,                       XK_p,      spawn,          {.v = dmenucmd } },
 	{ MODKEY|ShiftMask,             XK_Return, spawn,          {.v = termcmd } },
 	{ ALTMOD|ShiftMask,             XK_Return, spawn,          {.v = tabtermcmd } },
+	{ MODKEY|ShiftMask,				XK_Escape, spawn,       {.v = (const char*[]){ "dmenu_sys", NULL } } },
 	{ MODKEY,                       XK_grave,  togglescratch,  {.v = scratchpadcmd } },
 	{ MODKEY,                       XK_b,      togglebar,      {0} },
 	{ MODKEY,                       XK_j,      focusstack,     {.i = +1 } },
@@ -136,8 +137,8 @@ static const Key keys[] = {
 	{ MODKEY,                       XK_minus,  setgaps,        {.i = -1 } },
 	{ MODKEY,                       XK_equal,  setgaps,        {.i = +1 } },
 	{ MODKEY|ShiftMask,             XK_equal,  setgaps,        {.i = 0  } },
-    { ALTMOD,				XK_v,      spawn,       {.v = (const char*[]){ "dmenu_cliphist", "sel", NULL } } },
-	{ MODKEY,				XK_c,      spawn,       {.v = (const char*[]){ "dmenu_cliphist", "add", NULL } } },
+    { ALTMOD,        				XK_v,      spawn,          {.v = (const char*[]){ "dmenu_cliphist", "sel", NULL } } },
+	{ MODKEY,		         		XK_c,      spawn,          {.v = (const char*[]){ "dmenu_cliphist", "add", NULL } } },
 	TAGKEYS(                        XK_1,                      0)
 	TAGKEYS(                        XK_2,                      1)
 	TAGKEYS(                        XK_3,                      2)
@@ -160,7 +161,7 @@ static const Key keys[] = {
 	{ 0, XF86XK_Search, 		spawn, SHCMD("$BROWSER") },
 	{ 0, XK_Print,                  spawn, SHCMD("/usr/bin/maim -u | xclip -selection clipboard -t image/png; xclip -out -selection clipboard > ~/Pictures/Screenshots/$(date '+%F-%H-%M-%S').png")},
 	{ ShiftMask, XK_Print,          spawn, SHCMD("/usr/bin/maim -su | xclip -selection clipboard -t image/png; xclip -out -selection clipboard > ~/Pictures/Screenshots/$(date '+%F-%H-%M-%S').png")},
-	{ ShiftMask, XK_Escape,          spawn, SHCMD("~/.local/bin/change_keyboard_layout.sh")},
+	{ ALTMOD, XK_Escape,          spawn, SHCMD("~/.local/bin/change_keyboard_layout.sh")},
 
 };
 
