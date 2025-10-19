@@ -23,6 +23,10 @@ static char selfgcolor[]                 = "#eeeeee";
 static char selbgcolor[]                 = "#911d29"; 
 static char selbordercolor[]             = "#911d29"; 
 
+static char hidfgcolor[]                = "#bbbbbb"; 
+static char hidbgcolor[]                = "#59111D"; 
+static char hidbordercolor[]            = "#59111D"; 
+
 // /* Purple flavour colors */
 
 // static char normfgcolor[] = "#bbbbbb";
@@ -40,6 +44,7 @@ static char *colors[][3] ={
 /*               fg           bg         border                         */
     [SchemeNorm] = {normfgcolor, normbgcolor, normbordercolor},
     [SchemeSel] = {selfgcolor, selbgcolor, selbordercolor},
+    [SchemeHid] = {hidfgcolor, hidbgcolor, hidbordercolor},
 };
 
 
@@ -96,7 +101,7 @@ static const Layout layouts[] = {
 
 /* commands */
 static char dmenumon[2] = "0"; /* component of dmenucmd, manipulated in spawn() */
-static const char *dmenucmd[] = { "dmenu_run", "-c", "-g", "3", "-l", "10", "-m", dmenumon, "-fn", dmenufont, "-nb", normbgcolor, "-nf", normfgcolor, "-sb", selbordercolor, "-sf", selfgcolor, "-bw", "3",  NULL };
+static const char *dmenucmd[] = { "dmenu_run", "-c", "-g", "3", "-l", "10", "-m", dmenumon, "-fn", dmenufont, "-bw", "3",  NULL };
 static const char *termcmd[]  = { "st", NULL };
 static const char *tabtermcmd[]  = { "tabbed", "-r", "2", "st", "-w", "''", NULL };
 static const char scratchpadname[] = "scratchpad";
@@ -110,8 +115,10 @@ static const Key keys[] = {
 	{ MODKEY|ShiftMask,				XK_Escape, spawn,       {.v = (const char*[]){ "dmenu_sys", NULL } } },
 	{ MODKEY,                       XK_grave,  togglescratch,  {.v = scratchpadcmd } },
 	{ MODKEY,                       XK_b,      togglebar,      {0} },
-	{ MODKEY,                       XK_j,      focusstack,     {.i = +1 } },
-	{ MODKEY,                       XK_k,      focusstack,     {.i = -1 } },
+	{ MODKEY,                       XK_j,      focusstackvis,  {.i = +1 } },
+	{ MODKEY,                       XK_k,      focusstackvis,  {.i = -1 } },
+	{ MODKEY|ShiftMask,             XK_j,      focusstackhid,  {.i = +1 } },
+	{ MODKEY|ShiftMask,             XK_k,      focusstackhid,  {.i = -1 } },
 	{ MODKEY,                       XK_i,      incnmaster,     {.i = +1 } },
 	{ MODKEY,                       XK_d,      incnmaster,     {.i = -1 } },
 	{ MODKEY,                       XK_h,      setmfact,       {.f = -0.05} },
@@ -132,12 +139,15 @@ static const Key keys[] = {
 	{ MODKEY,                       XK_period, focusmon,       {.i = +1 } },
 	{ MODKEY|ShiftMask,             XK_comma,  tagmon,         {.i = -1 } },
 	{ MODKEY|ShiftMask,             XK_period, tagmon,         {.i = +1 } },
+	{ MODKEY,                       XK_a,      show,           {0} },
+	{ MODKEY|ShiftMask,             XK_a,      showall,        {0} },
+	{ ALTMOD,                       XK_h,      hide,           {0} },
 	{ MODKEY,                       XK_minus,  setgaps,        {.i = -1 } },
 	{ MODKEY,                       XK_equal,  setgaps,        {.i = +1 } },
 	{ MODKEY|ShiftMask,             XK_equal,  setgaps,        {.i = 0  } },
     { ALTMOD,        				XK_v,      spawn,          {.v = (const char*[]){ "dmenu_cliphist", "sel", NULL } } },
 	{ MODKEY,		         		XK_c,      spawn,          {.v = (const char*[]){ "dmenu_cliphist", "add", NULL } } },
-	{ MODKEY,                       XK_s,      xrdb,           {.v = NULL } },
+	{ MODKEY|ShiftMask,             XK_s,      xrdb,           {.v = NULL } },
 	TAGKEYS(                        XK_1,                      0)
 	TAGKEYS(                        XK_2,                      1)
 	TAGKEYS(                        XK_3,                      2)
@@ -149,18 +159,19 @@ static const Key keys[] = {
 	TAGKEYS(                        XK_9,                      8)
 	{ MODKEY|ShiftMask,             XK_q,      quit,           {0} },
 
-	{ 0, XF86XK_AudioLowerVolume,   spawn, SHCMD("/usr/bin/pamixer -d 5;kill -44 $(pidof dwmblocks)") },
-	{ 0, XF86XK_AudioMute,          spawn, SHCMD("/usr/bin/pamixer -t;kill -44 $(pidof dwmblocks)") },
-	{ 0, XF86XK_AudioRaiseVolume,   spawn, SHCMD("/usr/bin/pamixer -i 5;kill -44 $(pidof dwmblocks)") },
-	{ 0, XF86XK_MonBrightnessUp,    spawn, SHCMD("/usr/bin/xbacklight -inc 5;kill -40 $(pidof dwmblocks)") },
-	{ 0, XF86XK_MonBrightnessDown,  spawn, SHCMD("/usr/bin/xbacklight -dec 5;kill -40 $(pidof dwmblocks)") },
-	{ 0, XF86XK_AudioPrev,		spawn, SHCMD("/usr/bin/mpc prev") },
-	{ 0, XF86XK_AudioPlay,		spawn, SHCMD("/usr/bin/mpc toggle") },
-	{ 0, XF86XK_AudioNext,		spawn, SHCMD("/usr/bin/mpc next") },
-	{ 0, XF86XK_Search, 		spawn, SHCMD("$BROWSER") },
-	{ 0, XK_Print,                  spawn, SHCMD("/usr/bin/maim -u | xclip -selection clipboard -t image/png; xclip -out -selection clipboard > ~/Pictures/Screenshots/$(date '+%F-%H-%M-%S').png")},
-	{ ShiftMask, XK_Print,          spawn, SHCMD("/usr/bin/maim -su | xclip -selection clipboard -t image/png; xclip -out -selection clipboard > ~/Pictures/Screenshots/$(date '+%F-%H-%M-%S').png")},
-	{ ALTMOD, XK_Escape,          spawn, SHCMD("~/.local/bin/change_keyboard_layout.sh")},
+	{ 0,                            XF86XK_AudioLowerVolume,   spawn, SHCMD("/usr/bin/pamixer -d 5;kill -44 $(pidof dwmblocks)") },
+	{ 0,                            XF86XK_AudioMute,          spawn, SHCMD("/usr/bin/pamixer -t;kill -44 $(pidof dwmblocks)") },
+	{ 0,                            XF86XK_AudioRaiseVolume,   spawn, SHCMD("/usr/bin/pamixer -i 5;kill -44 $(pidof dwmblocks)") },
+	{ 0,                            XF86XK_MonBrightnessUp,    spawn, SHCMD("/usr/bin/xbacklight -inc 5;kill -40 $(pidof dwmblocks)") },
+	{ 0,                            XF86XK_MonBrightnessDown,  spawn, SHCMD("/usr/bin/xbacklight -dec 5;kill -40 $(pidof dwmblocks)") },
+	{ 0,                            XF86XK_AudioPrev,	       spawn, SHCMD("/usr/bin/mpc prev") },
+	{ 0,                            XF86XK_AudioPlay,		   spawn, SHCMD("/usr/bin/mpc toggle") },
+	{ 0,                            XF86XK_AudioNext,		   spawn, SHCMD("/usr/bin/mpc next") },
+	{ 0,                            XF86XK_Search, 		       spawn, SHCMD("$BROWSER") },
+	{ 0,                            XK_Print,                  spawn, SHCMD("/usr/bin/maim -u | xclip -selection clipboard -t image/png; xclip -out -selection clipboard > ~/Pictures/Screenshots/$(date '+%F-%H-%M-%S').png")},
+	{ ShiftMask,                    XK_Print,                  spawn, SHCMD("/usr/bin/maim -su | xclip -selection clipboard -t image/png; xclip -out -selection clipboard > ~/Pictures/Screenshots/$(date '+%F-%H-%M-%S').png")},
+	{ ALTMOD,                       XK_Escape,                 spawn, SHCMD("~/.local/bin/change_keyboard_layout.sh")},
+	{ MODKEY,                       XK_s,                      spawn, SHCMD("~/.local/bin/change_theme.sh")},
 
 };
 
@@ -170,6 +181,7 @@ static const Button buttons[] = {
 	/* click                event mask      button          function        argument */
 	{ ClkLtSymbol,          0,              Button1,        setlayout,      {0} },
 	{ ClkLtSymbol,          0,              Button3,        setlayout,      {.v = &layouts[2]} },
+	{ ClkWinTitle,          0,              Button1,        togglewin,      {0} },
 	{ ClkWinTitle,          0,              Button2,        zoom,           {0} },
 	{ ClkStatusText,        0,              Button2,        spawn,          {.v = termcmd } },
 	{ ClkClientWin,         MODKEY,         Button1,        movemouse,      {0} },
