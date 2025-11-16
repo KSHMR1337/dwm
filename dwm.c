@@ -888,22 +888,19 @@ void
 drawbar(Monitor *m)
 {
     int x, w, tw = 0, n = 0, scm;
+    int boxs = drw->fonts->h / 9;
+    int boxw = drw->fonts->h / 6 + 2;
     unsigned int i, occ = 0, urg = 0;
     Client *c;
 
     if (!m->showbar)
         return;
 
-    /* Reserve half the screen width for tabs */
-    int tab_area = m->ww / 2;
-    m->bt = 0;
-    m->btw = tab_area;
-
     /* Draw full-width background */
     drw_setscheme(drw, scheme[SchemeNorm]);
     drw_rect(drw, 0, 0, m->ww, bh, 1, 1);
 
-    /* Draw status text (clock/menu) full-width */
+    /* Draw status text first and measure its width */
     tw = TEXTW(stext) - lrpad + 2;
     drw_text(drw, m->ww - tw - 2 * sp, 0, tw, bh, 0, stext, 0);
 
@@ -915,9 +912,8 @@ drawbar(Monitor *m)
         if (c->isurgent)
             urg |= c->tags;
     }
-    m->bt = n;
 
-    /* Draw tags (full-width) */
+    /* Draw tags and track position */
     x = 0;
     for (i = 0; i < LENGTH(tags); i++) {
         if (!(occ & 1 << i || m->tagset[m->seltags] & 1 << i))
@@ -929,13 +925,18 @@ drawbar(Monitor *m)
         x += w;
     }
 
-    /* Draw layout symbol (full-width) */
+    /* Draw layout symbol and track position */
     w = TEXTW(m->ltsymbol);
     drw_setscheme(drw, scheme[SchemeNorm]);
     x = drw_text(drw, x, 0, w, bh, lrpad/2, m->ltsymbol, 0);
 
-    /* Draw client tabs using only left half of the screen */
-    if (n > 0) {
+    /* Calculate remaining space for tabs dynamically */
+    int tab_area = m->ww - x - tw - 2 * sp;
+    m->bt = n;
+    m->btw = tab_area;
+
+    /* Draw client tabs with floating indicators */
+    if (n > 0 && tab_area > 0) {
         int tabw = tab_area / n;
         int rem  = tab_area - tabw * n;
         for (c = m->clients; c; c = c->next) {
@@ -948,8 +949,16 @@ drawbar(Monitor *m)
             else
                 scm = SchemeNorm;
             drw_setscheme(drw, scheme[scm]);
+            
             w = tabw + (rem-- > 0);
             drw_text(drw, x, 0, w, bh, lrpad/2, c->name, 0);
+            
+            /* Draw floating indicator box if window is floating */
+            if (c->isfloating) {
+                drw_rect(drw, x + boxs, boxs, boxw, boxw, 
+                    c->isfixed, 0);
+            }
+            
             x += w;
         }
     }
@@ -957,9 +966,6 @@ drawbar(Monitor *m)
     /* Render the bar */
     drw_map(drw, m->barwin, 0, 0, m->ww, bh);
 }
-
-
-
 
 void drawbars(void) {
   Monitor *m;

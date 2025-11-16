@@ -10,8 +10,8 @@ static const int topbar             = 1;        /* 0 means bottom bar */
 static const int user_bh            = 6;        /* 2 is the default spacing around the bar's font */
 static const int vertpad            = 10;       /* vertical padding of bar */
 static const int sidepad            = 15;       /* horizontal padding of bar */
-static const char *fonts[]          = { "Hack Nerd Font:pixelsize=15:antialias=true:autohint=true" };
-static const char dmenufont[]       = "Hack Nerd Font:pixelsize=15:antialias=true:autohint=true";
+static const char *fonts[] = { "Hack Nerd Font Mono:pixelsize=15:antialias=true:autohint=true" };
+static const char dmenufont[] = "Hack Nerd Font Mono:pixelsize=15:antialias=true:autohint=true";
 
 /* Red flavour colors */
 
@@ -112,7 +112,6 @@ static const Key keys[] = {
 	{ MODKEY,                       XK_p,      spawn,          {.v = dmenucmd } },
 	{ MODKEY|ShiftMask,             XK_Return, spawn,          {.v = termcmd } },
 	{ ALTMOD|ShiftMask,             XK_Return, spawn,          {.v = tabtermcmd } },
-	{ MODKEY|ShiftMask,				XK_Escape, spawn,       {.v = (const char*[]){ "dmenu_sys", NULL } } },
 	{ MODKEY,                       XK_grave,  togglescratch,  {.v = scratchpadcmd } },
 	{ MODKEY,                       XK_b,      togglebar,      {0} },
 	{ MODKEY,                       XK_j,      focusstackvis,  {.i = +1 } },
@@ -145,8 +144,6 @@ static const Key keys[] = {
 	{ MODKEY,                       XK_minus,  setgaps,        {.i = -1 } },
 	{ MODKEY,                       XK_equal,  setgaps,        {.i = +1 } },
 	{ MODKEY|ShiftMask,             XK_equal,  setgaps,        {.i = 0  } },
-    { ALTMOD,        				XK_v,      spawn,          {.v = (const char*[]){ "dmenu_cliphist", "sel", NULL } } },
-	{ MODKEY,		         		XK_c,      spawn,          {.v = (const char*[]){ "dmenu_cliphist", "add", NULL } } },
 	{ MODKEY|ShiftMask,             XK_s,      xrdb,           {.v = NULL } },
 	TAGKEYS(                        XK_1,                      0)
 	TAGKEYS(                        XK_2,                      1)
@@ -170,9 +167,18 @@ static const Key keys[] = {
 	{ 0,                            XF86XK_Search, 		       spawn, SHCMD("$BROWSER") },
 	{ 0,                            XK_Print,                  spawn, SHCMD("/usr/bin/maim -u | xclip -selection clipboard -t image/png; xclip -out -selection clipboard > ~/Pictures/Screenshots/$(date '+%F-%H-%M-%S').png")},
 	{ ShiftMask,                    XK_Print,                  spawn, SHCMD("/usr/bin/maim -su | xclip -selection clipboard -t image/png; xclip -out -selection clipboard > ~/Pictures/Screenshots/$(date '+%F-%H-%M-%S').png")},
+
+    { ALTMOD,        				XK_v,      spawn,          {.v = (const char*[]){ "dmenu_cliphist", "sel", NULL } } },
+	{ MODKEY,		         		XK_c,      spawn,          {.v = (const char*[]){ "dmenu_cliphist", "add", NULL } } },
+	{ MODKEY|ShiftMask,				XK_Escape, spawn,          {.v = (const char*[]){ "dmenu_sys", NULL } } },
 	{ ALTMOD,                       XK_Escape,                 spawn, SHCMD("~/.local/bin/change_keyboard_layout.sh")},
 	{ MODKEY,                       XK_s,                      spawn, SHCMD("~/.local/bin/change_theme.sh")},
 
+	{ MODKEY|ALTMOD|ShiftMask,      XK_s,                      spawn, SHCMD("pavucontrol")},
+	{ MODKEY|ALTMOD|ShiftMask,      XK_b,                      spawn, SHCMD("blueman-manager")},
+	{ MODKEY|ALTMOD|ShiftMask,      XK_d,                      spawn, SHCMD("discord")},
+	{ MODKEY|ALTMOD|ShiftMask,      XK_o,                      spawn, SHCMD("obsidian")},
+	{ MODKEY|ALTMOD|ShiftMask,      XK_v,                      spawn, SHCMD("stremio")},
 };
 
 /* button definitions */
