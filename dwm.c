@@ -262,8 +262,10 @@ static void maprequest(XEvent *e);
 static void monocle(Monitor *m);
 static void motionnotify(XEvent *e);
 static void movemouse(const Arg *arg);
+static unsigned int nexttag(void);
 static Client *nexttiled(Client *c);
 static void pop(Client *c);
+static unsigned int prevtag(void);
 static void propertynotify(XEvent *e);
 static void quit(const Arg *arg);
 static Monitor *recttomon(int x, int y, int w, int h);
@@ -291,6 +293,8 @@ static void sigstatusbar(const Arg *arg);
 static void spawn(const Arg *arg);
 static void tag(const Arg *arg);
 static void tagmon(const Arg *arg);
+static void tagtonext(const Arg *arg);
+static void tagtoprev(const Arg *arg);
 static void tagnthmon(const Arg *arg);
 static void tile(Monitor *m);
 static void togglebar(const Arg *arg);
@@ -313,6 +317,8 @@ static void updatetitle(Client *c);
 static void updatewindowtype(Client *c);
 static void updatewmhints(Client *c);
 static void view(const Arg *arg);
+static void viewnext(const Arg *arg);
+static void viewprev(const Arg *arg);
 static Client *wintoclient(Window w);
 static Monitor *wintomon(Window w);
 static int xerror(Display *dpy, XErrorEvent *ee);
@@ -927,27 +933,25 @@ void drawbar(Monitor *m) {
   Client *c;
   if (!m->showbar)
     return;
-  /* draw status first so it can be overdrawn by tags later */
-  if (m == selmon) { /* status is only drawn on selected monitor */
-    char *text, *s, ch;
-    drw_setscheme(drw, scheme[SchemeNorm]);
-
-    x = 0;
-    for (text = s = stext; *s; s++) {
-      if ((unsigned char)(*s) < ' ') {
-        ch = *s;
-        *s = '\0';
-        tw = TEXTW(text) - lrpad;
-        drw_text(drw, m->ww - 2 * sp - statusw + x, 0, tw, bh, 0, text, 0);
-        x += tw;
-        *s = ch;
-        text = s + 1;
-      }
+  /* draw status on all monitors */
+  char *text, *s, ch;
+  drw_setscheme(drw, scheme[SchemeNorm]);
+  x = 0;
+  for (text = s = stext; *s; s++) {
+    if ((unsigned char)(*s) < ' ') {
+      ch = *s;
+      *s = '\0';
+      tw = TEXTW(text) - lrpad;
+      drw_text(drw, m->ww - 2 * sp - statusw + x, 0, tw, bh, 0, text, 0);
+      x += tw;
+      *s = ch;
+      text = s + 1;
     }
-    tw = TEXTW(text) - lrpad + 2;
-    drw_text(drw, m->ww - 2 * sp - statusw + x, 0, tw, bh, 0, text, 0);
-    tw = statusw;
   }
+  tw = TEXTW(text) - lrpad + 2;
+  drw_text(drw, m->ww - 2 * sp - statusw + x, 0, tw, bh, 0, text, 0);
+  tw = statusw;
+
   for (c = m->clients; c; c = c->next) {
     if (ISVISIBLE(c))
       n++;
@@ -977,13 +981,12 @@ void drawbar(Monitor *m) {
         if (!ISVISIBLE(c))
           continue;
         if (m->sel == c)
-          scm = SchemeSel;
+          scm = m == selmon ? SchemeSel : SchemeNorm;
         else if (HIDDEN(c))
           scm = SchemeHid;
         else
           scm = SchemeNorm;
         drw_setscheme(drw, scheme[scm]);
-
         if (remainder >= 0) {
           if (remainder == 0) {
             tabw--;
@@ -994,7 +997,7 @@ void drawbar(Monitor *m) {
         x += tabw;
       }
     } else {
-      drw_setscheme(drw, scheme[SchemeNorm]);
+      drw_setscheme(drw, scheme[m == selmon ? SchemeSel : SchemeNorm]);
       drw_rect(drw, x, 0, w, bh, 1, 1);
     }
   }
@@ -1175,7 +1178,7 @@ pid_t getstatusbarpid() {
         return statuspid;
     }
   }
-  if (!(fp = popen("pidof -s "STATUSBAR, "r")))
+  if (!(fp = popen("pidof -s " STATUSBAR, "r")))
     return -1;
   fgets(buf, sizeof(buf), fp);
   pclose(fp);
@@ -1557,6 +1560,11 @@ void movemouse(const Arg *arg) {
   }
 }
 
+unsigned int nexttag(void) {
+  unsigned int seltag = selmon->tagset[selmon->seltags];
+  return seltag == (1 << (LENGTH(tags) - 1)) ? 1 : seltag << 1;
+}
+
 Client *nexttiled(Client *c) {
   for (; c && (c->isfloating || !ISVISIBLE(c) || HIDDEN(c)); c = c->next)
     ;
@@ -1568,6 +1576,11 @@ void pop(Client *c) {
   attach(c);
   focus(c);
   arrange(c->mon);
+}
+
+unsigned int prevtag(void) {
+  unsigned int seltag = selmon->tagset[selmon->seltags];
+  return seltag == 1 ? (1 << (LENGTH(tags) - 1)) : seltag >> 1;
 }
 
 void propertynotify(XEvent *e) {
@@ -1780,10 +1793,11 @@ void sendmon(Client *c, Monitor *m) {
   detach(c);
   detachstack(c);
   c->mon = m;
-  c->tags = m->tagset[m->seltags]; /* assign tags of target monitor */
+  c->tags = m->tagset[m->seltags];
   attach(c);
   attachstack(c);
-  focus(NULL);
+  selmon = m;      /* switch to target monitor */
+  focus(c);        /* focus the sent client specifically */
   arrange(NULL);
 }
 
@@ -2069,6 +2083,28 @@ void tagnthmon(const Arg *arg) {
   if (!selmon->sel || !mons->next)
     return;
   sendmon(selmon->sel, numtomon(arg->i));
+}
+
+void tagtonext(const Arg *arg) {
+  unsigned int tmp;
+
+  if (selmon->sel == NULL)
+    return;
+
+  tmp = nexttag();
+  tag(&(const Arg){.ui = tmp});
+  view(&(const Arg){.ui = tmp});
+}
+
+void tagtoprev(const Arg *arg) {
+  unsigned int tmp;
+
+  if (selmon->sel == NULL)
+    return;
+
+  tmp = prevtag();
+  tag(&(const Arg){.ui = tmp});
+  view(&(const Arg){.ui = tmp});
 }
 
 void tile(Monitor *m) {
@@ -2673,6 +2709,10 @@ Client *swallowingclient(Window w) {
 
   return NULL;
 }
+
+void viewnext(const Arg *arg) { view(&(const Arg){.ui = nexttag()}); }
+
+void viewprev(const Arg *arg) { view(&(const Arg){.ui = prevtag()}); }
 
 Client *wintoclient(Window w) {
   Client *c;
