@@ -1,0 +1,14 @@
+# Claude Code related files
+.claude/
+CLAUDE.md
+
+# dwm build artifacts
+*.o
+dwm
+config.h
+
+# System files
+*.swp
+*.swo
+*~
+.DS_Store

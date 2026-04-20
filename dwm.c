@@ -520,7 +520,8 @@ void arrange(Monitor *m) {
 }
 
 void arrangemon(Monitor *m) {
-  strncpy(m->ltsymbol, m->lt[m->sellt]->symbol, sizeof m->ltsymbol);
+  strncpy(m->ltsymbol, m->lt[m->sellt]->symbol, sizeof m->ltsymbol - 1);
+  m->ltsymbol[sizeof m->ltsymbol - 1] = '\0';
   if (m->lt[m->sellt]->arrange)
     m->lt[m->sellt]->arrange(m);
 }
@@ -537,9 +538,9 @@ void attachstack(Client *c) {
 
 void swallow(Client *p, Client *c) {
 
-  if (c->noswallow || c->isterminal)
+  if (c->isterminal)
     return;
-  if (c->noswallow && !swallowfloating && c->isfloating)
+  if (c->noswallow && !(swallowfloating && c->isfloating))
     return;
 
   detach(c);
@@ -641,8 +642,11 @@ void buttonpress(XEvent *e) {
             x += (1.0 / (double)m->bt) * m->btw;
         } while (ev->x > x && (c = c->next));
 
-        click = ClkWinTitle;
-        arg.v = c;
+        /* only set click if we found a valid client */
+        if (c) {
+          click = ClkWinTitle;
+          arg.v = c;
+        }
       }
     }
   } else if ((c = wintoclient(ev->window))) {
@@ -708,6 +712,7 @@ void cleanupmon(Monitor *mon) {
   }
   XUnmapWindow(dpy, mon->barwin);
   XDestroyWindow(dpy, mon->barwin);
+  free(mon->pertag);
   free(mon);
 }
 
@@ -837,7 +842,8 @@ Monitor *createmon(void) {
   m->gappx = gappx;
   m->lt[0] = &layouts[0];
   m->lt[1] = &layouts[1 % LENGTH(layouts)];
-  strncpy(m->ltsymbol, layouts[0].symbol, sizeof m->ltsymbol);
+  strncpy(m->ltsymbol, layouts[0].symbol, sizeof m->ltsymbol - 1);
+  m->ltsymbol[sizeof m->ltsymbol - 1] = '\0';
   m->pertag = ecalloc(1, sizeof(Pertag));
   m->pertag->curtag = m->pertag->prevtag = 1;
 
@@ -1374,9 +1380,8 @@ void loadxrdb() {
         XRDB_LOAD_COLOR("dwm.hidfgcolor", hidfgcolor);
       }
     }
+    XCloseDisplay(display);
   }
-
-  XCloseDisplay(display);
 }
 
 void manage(Window w, XWindowAttributes *wa) {
@@ -1883,7 +1888,8 @@ void setlayout(const Arg *arg) {
         selmon->pertag->ltidxs[selmon->pertag->curtag][selmon->sellt] =
             (Layout *)arg->v;
   strncpy(selmon->ltsymbol, selmon->lt[selmon->sellt]->symbol,
-          sizeof selmon->ltsymbol);
+          sizeof selmon->ltsymbol - 1);
+  selmon->ltsymbol[sizeof selmon->ltsymbol - 1] = '\0';
   if (selmon->sel)
     arrange(selmon);
   else
@@ -2046,11 +2052,15 @@ void showhide(Client *c) {
 
 void spawn(const Arg *arg) {
   struct sigaction sa;
+  pid_t pid;
 
   if (arg->v == dmenucmd)
     dmenumon[0] = '0' + selmon->num;
   selmon->tagset[selmon->seltags] &= ~scratchtag;
-  if (fork() == 0) {
+  pid = fork();
+  if (pid == -1)
+    return;
+  if (pid == 0) {
     if (dpy)
       close(ConnectionNumber(dpy));
     setsid();
@@ -2123,13 +2133,13 @@ void tile(Monitor *m) {
   for (i = 0, my = ty = m->gappx, c = nexttiled(m->clients); c;
        c = nexttiled(c->next), i++)
     if (i < m->nmaster) {
-      h = (m->wh - my) / (MIN(n, m->nmaster) - i) - m->gappx;
+      h = (MIN(n, m->nmaster) - i > 0) ? (m->wh - my) / (MIN(n, m->nmaster) - i) - m->gappx : m->wh - my;
       resize(c, m->wx + m->gappx, m->wy + my, mw - (2 * c->bw) - m->gappx,
              h - (2 * c->bw), 0);
       if (my + HEIGHT(c) + m->gappx < m->wh)
         my += HEIGHT(c) + m->gappx;
     } else {
-      h = (m->wh - ty) / (n - i) - m->gappx;
+      h = (n - i > 0) ? (m->wh - ty) / (n - i) - m->gappx : m->wh - ty;
       resize(c, m->wx + mw + m->gappx, m->wy + ty,
              m->ww - mw - (2 * c->bw) - 2 * m->gappx, h - (2 * c->bw), 0);
       if (ty + HEIGHT(c) + m->gappx < m->wh)
@@ -2232,6 +2242,9 @@ void toggleview(const Arg *arg) {
 
 void togglewin(const Arg *arg) {
   Client *c = (Client *)arg->v;
+
+  if (!c)
+    return;
 
   if (c == selmon->sel) {
     hidewin(c);
@@ -2879,17 +2892,17 @@ void centeredmaster(Monitor *m) {
     if (i < m->nmaster) {
       /* nmaster clients are stacked vertically, in the center
        * of the screen */
-      h = (m->wh - my) / (MIN(n, m->nmaster) - i);
+      h = (MIN(n, m->nmaster) - i > 0) ? (m->wh - my) / (MIN(n, m->nmaster) - i) : m->wh - my;
       resize(c, m->wx + mx, m->wy + my, mw - (2 * c->bw), h - (2 * c->bw), 0);
       my += HEIGHT(c);
     } else {
       /* stack clients are stacked vertically */
       if ((i - m->nmaster) % 2) {
-        h = (m->wh - ety) / ((1 + n - i) / 2);
+        h = ((1 + n - i) / 2 > 0) ? (m->wh - ety) / ((1 + n - i) / 2) : m->wh - ety;
         resize(c, m->wx, m->wy + ety, tw - (2 * c->bw), h - (2 * c->bw), 0);
         ety += HEIGHT(c);
       } else {
-        h = (m->wh - oty) / ((1 + n - i) / 2);
+        h = ((1 + n - i) / 2 > 0) ? (m->wh - oty) / ((1 + n - i) / 2) : m->wh - oty;
         resize(c, m->wx + mx + mw, m->wy + oty, tw - (2 * c->bw),
                h - (2 * c->bw), 0);
         oty += HEIGHT(c);
@@ -2931,12 +2944,12 @@ void centeredfloatingmaster(Monitor *m) {
     if (i < m->nmaster) {
       /* nmaster clients are stacked horizontally, in the center
        * of the screen */
-      w = (mw + mxo - mx) / (MIN(n, m->nmaster) - i);
+      w = (MIN(n, m->nmaster) - i > 0) ? (mw + mxo - mx) / (MIN(n, m->nmaster) - i) : mw + mxo - mx;
       resize(c, m->wx + mx, m->wy + my, w - (2 * c->bw), mh - (2 * c->bw), 0);
       mx += WIDTH(c);
     } else {
       /* stack clients are stacked horizontally */
-      w = (m->ww - tx) / (n - i);
+      w = (n - i > 0) ? (m->ww - tx) / (n - i) : m->ww - tx;
       resize(c, m->wx + tx, m->wy, w - (2 * c->bw), m->wh - (2 * c->bw), 0);
       tx += WIDTH(c);
     }
