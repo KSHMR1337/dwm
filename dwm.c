@@ -28,6 +28,7 @@
 #include <X11/cursorfont.h>
 #include <X11/keysym.h>
 #include <errno.h>
+#include <math.h>
 #include <locale.h>
 #include <signal.h>
 #include <stdarg.h>
@@ -172,6 +173,16 @@ typedef struct {
   const char *symbol;
   void (*arrange)(Monitor *);
 } Layout;
+
+/* Alt-tab workspace preview */
+typedef struct {
+	Monitor *mon;          /* which monitor owns this workspace */
+	unsigned int tagmask;  /* tag bitmask (single bit) */
+	int tagidx;            /* 0-based tag index on that monitor */
+	int clientcount;       /* number of visible clients */
+	Pixmap thumbnail;      /* scaled screenshot, 0 if not yet captured */
+	int tw, th;            /* thumbnail pixel dimensions */
+} Workspace;
 
 typedef struct Pertag Pertag;
 struct Monitor {
@@ -336,6 +347,16 @@ static void xrdb(const Arg *arg);
 static void zoom(const Arg *arg);
 static void centeredmaster(Monitor *m);
 static void centeredfloatingmaster(Monitor *m);
+/* alt-tab preview */
+static void alttab(const Arg *arg);
+static void alttabprev(const Arg *arg);
+static void alttabend(int commit);
+static void keyrelease(XEvent *e);
+static void scanworkspaces(void);
+static void captureworkspace(int idx);
+static void drawaltpreview(void);
+static void calculategrid(int count, int *rows, int *cols);
+static Monitor *primarymon(void);
 
 static pid_t getparentprocess(pid_t p);
 static int isdescprocess(pid_t p, pid_t c);
@@ -367,6 +388,7 @@ static void (*handler[LASTEvent])(XEvent *) = {
     [Expose] = expose,
     [FocusIn] = focusin,
     [KeyPress] = keypress,
+    [KeyRelease] = keyrelease,
     [MappingNotify] = mappingnotify,
     [MapRequest] = maprequest,
     [MotionNotify] = motionnotify,
@@ -387,6 +409,16 @@ static int depth;
 static Colormap cmap;
 
 static xcb_connection_t *xcon;
+
+/* alt-tab preview state */
+#define ATAB_MAX_WS 90  /* 9 tags * 10 monitors */
+static Workspace atab_ws[ATAB_MAX_WS];
+static int atab_count   = 0;  /* number of non-empty workspaces found */
+static int atab_sel     = 0;  /* currently highlighted index */
+static int atab_active     = 0;  /* 1 while overlay is shown */
+static int atab_committing = 0;  /* 1 during alttabend commit to suppress switchtag capture */
+static Window atab_win  = 0;  /* the overlay window */
+static int atab_origidx = 0;  /* index of workspace we came from */
 
 /* configuration, allows nested code to access above variables */
 #include "config.h"
@@ -708,6 +740,19 @@ void cleanup(void) {
   for (i = 0; i < LENGTH(colors); i++)
     free(scheme[i]);
   free(scheme);
+  /* alt-tab cleanup */
+  if (atab_active)
+    alttabend(0);
+  if (atab_win) {
+    XDestroyWindow(dpy, atab_win);
+    atab_win = 0;
+  }
+  {
+    int _i;
+    for (_i = 0; _i < atab_count; _i++)
+      if (atab_ws[_i].thumbnail)
+        XFreePixmap(dpy, atab_ws[_i].thumbnail);
+  }
   XDestroyWindow(dpy, wmcheckwin);
   drw_free(drw);
   XSync(dpy, False);
@@ -1358,6 +1403,36 @@ void keypress(XEvent *e) {
 
   ev = &e->xkey;
   keysym = XKeycodeToKeysym(dpy, (KeyCode)ev->keycode, 0);
+
+  /* intercept keys while alt-tab overlay is open */
+  if (atab_active) {
+    if (keysym == XK_Escape) {
+      alttabend(0);  /* cancel, return to original */
+      return;
+    }
+    if (keysym == XK_Tab) {
+      if (ev->state & ShiftMask) {
+        atab_sel = (atab_sel - 1 + atab_count) % atab_count;
+      } else {
+        atab_sel = (atab_sel + 1) % atab_count;
+      }
+      drawaltpreview();
+      return;
+    }
+    if (keysym == ALTTABPREV_KEY) {
+      atab_sel = (atab_sel - 1 + atab_count) % atab_count;
+      drawaltpreview();
+      return;
+    }
+    if (keysym == ALTTAB_KEY) {
+      atab_sel = (atab_sel + 1) % atab_count;
+      drawaltpreview();
+      return;
+    }
+    /* eat all other keys while preview is active */
+    return;
+  }
+
   for (i = 0; i < LENGTH(keys); i++)
     if (keysym == keys[i].keysym &&
         CLEANMASK(keys[i].mod) == CLEANMASK(ev->state) && keys[i].func)
@@ -2058,7 +2133,8 @@ void setup(void) {
   wa.cursor = cursor[CurNormal]->cursor;
   wa.event_mask = SubstructureRedirectMask | SubstructureNotifyMask |
                   ButtonPressMask | PointerMotionMask | EnterWindowMask |
-                  LeaveWindowMask | StructureNotifyMask | PropertyChangeMask;
+                  LeaveWindowMask | StructureNotifyMask | PropertyChangeMask |
+                  KeyReleaseMask;
   XChangeWindowAttributes(dpy, root, CWEventMask | CWCursor, &wa);
   XSelectInput(dpy, root, wa.event_mask);
   grabkeys();
@@ -2482,7 +2558,7 @@ void switchtag(void) {
         XFreePixmap(dpy, selmon->tagmap[i]);
         selmon->tagmap[i] = 0;
       }
-      if (occ & 1 << i && tag_preview) {
+      if (occ & 1 << i && tag_preview && !atab_committing) {
         /* Capture root window using Imlib2 with default visual context */
         imlib_context_set_display(dpy);
         imlib_context_set_visual(dvis);
@@ -3125,4 +3201,611 @@ void centeredfloatingmaster(Monitor *m) {
       resize(c, m->wx + tx, m->wy, w - (2 * c->bw), m->wh - (2 * c->bw), 0);
       tx += WIDTH(c);
     }
+}
+
+/* ============================================================
+ * Alt-tab workspace preview — pure Xlib rendering
+ * No Drw involved: all drawing uses XFillRectangle/XCopyArea/Xft
+ * with DefaultVisual/DefaultDepth throughout so depth is always consistent.
+ * Thumbnails reuse selmon->tagmap[] (populated by switchtag) so we never
+ * need to capture non-visible tags.
+ * Background uses fake transparency: a screenshot of the area behind the
+ * overlay is composited at reduced opacity before drawing cells on top.
+ * ============================================================ */
+
+Monitor *
+primarymon(void)
+{
+	Monitor *m;
+	for (m = mons; m; m = m->next)
+		if (m->num == 0)
+			return m;
+	return selmon;
+}
+
+void
+calculategrid(int count, int *rows, int *cols)
+{
+	if (count <= 0) { *rows = 1; *cols = 1; return; }
+	if (count <= 3) { *rows = 1; *cols = count; return; }
+	*rows = (int)ceil(sqrt((double)count));
+	*cols = (count + *rows - 1) / *rows;
+}
+
+void
+scanworkspaces(void)
+{
+	Monitor *m;
+	Client *c;
+	int i, n = 0;
+
+	atab_count = 0;
+
+	/* slot 0: selmon's current tag */
+	{
+		unsigned int curtag = selmon->tagset[selmon->seltags];
+		int cnt = 0, tidx = 0;
+		for (c = selmon->clients; c; c = c->next)
+			if (c->tags & curtag) cnt++;
+		for (i = 0; i < (int)LENGTH(tags); i++)
+			if ((1u << i) == curtag) { tidx = i; break; }
+		if (cnt > 0 && n < ATAB_MAX_WS)
+			atab_ws[n++] = (Workspace){selmon, curtag, tidx, cnt, 0, 0, 0};
+	}
+
+	for (int pass = 0; pass < 2 && n < ATAB_MAX_WS; pass++) {
+		for (m = mons; m && n < ATAB_MAX_WS; m = m->next) {
+			if (pass == 0 && m != selmon) continue;
+			if (pass == 1 && m == selmon) continue;
+			unsigned int curtag = selmon->tagset[selmon->seltags];
+			for (i = 0; i < (int)LENGTH(tags) && n < ATAB_MAX_WS; i++) {
+				unsigned int mask = 1u << i;
+				if (m == selmon && mask == curtag) continue;
+				int cnt = 0;
+				for (c = m->clients; c; c = c->next)
+					if (c->tags & mask) cnt++;
+				if (cnt == 0) continue;
+				atab_ws[n++] = (Workspace){m, mask, i, cnt, 0, 0, 0};
+			}
+		}
+	}
+	atab_count = n;
+}
+
+/*
+ * Populate ws->thumbnail by reusing the monitor's pre-captured tagmap pixmap.
+ * switchtag() captures a screenshot of each tag before switching away,
+ * so tagmap[i] is available for every tag the user has previously visited.
+ * We copy the pixmap so we own it independently.
+ *
+ * For the currently-visible tag on selmon we do a live capture since the
+ * screen is already showing it.
+ */
+void
+captureworkspace(int idx)
+{
+	Workspace *ws  = &atab_ws[idx];
+	Monitor *m     = ws->mon;
+	int ddepth     = DefaultDepth(dpy, screen);
+	Visual *dvis   = DefaultVisual(dpy, screen);
+	Colormap dcmap = DefaultColormap(dpy, screen);
+	Window droot   = RootWindow(dpy, screen);
+	int tw, th;
+	int tagidx     = ws->tagidx;
+	GC gc;
+
+	/* free any old thumbnail */
+	if (ws->thumbnail) {
+		XFreePixmap(dpy, ws->thumbnail);
+		ws->thumbnail = 0;
+		ws->tw = ws->th = 0;
+	}
+
+	tw = m->mw / scalepreview;
+	th = m->mh / scalepreview;
+	if (tw <= 0 || th <= 0) return;
+
+	/* Case 1: tagmap already has a screenshot for this tag — copy it */
+	if (tagidx >= 0 && tagidx < (int)LENGTH(tags) && m->tagmap[tagidx]) {
+		ws->thumbnail = XCreatePixmap(dpy, droot, tw, th, ddepth);
+		if (!ws->thumbnail) return;
+		gc = XCreateGC(dpy, ws->thumbnail, 0, NULL);
+		XCopyArea(dpy, m->tagmap[tagidx], ws->thumbnail, gc, 0, 0, tw, th, 0, 0);
+		XFreeGC(dpy, gc);
+		ws->tw = tw;
+		ws->th = th;
+		return;
+	}
+
+	/* Case 2: tag is currently visible on its monitor — live capture */
+	if (m->tagset[m->seltags] == ws->tagmask) {
+		Imlib_Image img;
+
+		XSetErrorHandler(xerrordummy);
+
+		imlib_context_set_display(dpy);
+		imlib_context_set_visual(dvis);
+		imlib_context_set_colormap(dcmap);
+		imlib_context_set_drawable(droot);
+		imlib_context_set_anti_alias(0);
+		imlib_context_set_dither(0);
+
+		img = imlib_create_image_from_drawable(0, m->mx, m->my, m->mw, m->mh, 1);
+
+		XSetErrorHandler(xerror);
+
+		if (!img) return;
+
+		imlib_context_set_image(img);
+		ws->thumbnail = XCreatePixmap(dpy, droot, tw, th, ddepth);
+		if (!ws->thumbnail) { imlib_free_image(); return; }
+
+		imlib_context_set_visual(dvis);
+		imlib_context_set_colormap(dcmap);
+		imlib_context_set_drawable(ws->thumbnail);
+		imlib_render_image_part_on_drawable_at_size(
+		    0, 0, m->mw, m->mh, 0, 0, tw, th);
+		imlib_free_image();
+		ws->tw = tw;
+		ws->th = th;
+	}
+	/* Case 3: tag not visible and no tagmap — leave thumbnail NULL (placeholder) */
+}
+
+/*
+ * Parse a hex color string ("#rrggbb") into an XftColor using
+ * DefaultVisual/DefaultColormap — safe for DefaultDepth drawables.
+ */
+static void
+atab_alloc_color(XftColor *clr, const char *hex)
+{
+	XftColorAllocName(dpy, DefaultVisual(dpy, screen),
+	    DefaultColormap(dpy, screen), hex, clr);
+}
+
+/*
+ * Fake transparency: capture screen pixels behind the overlay region,
+ * then blend normbgcolor at `alpha` opacity on top, and render the result
+ * onto canvas.  alpha=0 → pure background, alpha=255 → fully opaque tint.
+ *
+ * We use ~104/255 (~41%) so the desktop is clearly visible through the panel.
+ */
+static void
+atab_blend_background(Pixmap canvas, int wx, int wy, int ww, int wh,
+    unsigned char alpha)
+{
+	Visual    *dvis  = DefaultVisual(dpy, screen);
+	Colormap   dcmap = DefaultColormap(dpy, screen);
+	Window     droot = RootWindow(dpy, screen);
+	Imlib_Image bg, tint;
+	unsigned int r = 0, g = 0, b = 0;
+
+	XSetErrorHandler(xerrordummy);
+
+	imlib_context_set_display(dpy);
+	imlib_context_set_visual(dvis);
+	imlib_context_set_colormap(dcmap);
+	imlib_context_set_drawable(droot);
+	imlib_context_set_anti_alias(0);
+	imlib_context_set_dither(0);
+
+	/* Grab screen pixels behind the overlay */
+	bg = imlib_create_image_from_drawable(0, wx, wy, ww, wh, 1);
+
+	XSetErrorHandler(xerror);
+
+	if (!bg) return;
+
+	/* Create solid tint image with alpha */
+	tint = imlib_create_image(ww, wh);
+	if (!tint) {
+		imlib_context_set_image(bg);
+		imlib_free_image();
+		return;
+	}
+
+	sscanf(normbgcolor, "#%02x%02x%02x", &r, &g, &b);
+
+	imlib_context_set_image(tint);
+	imlib_image_set_has_alpha(1);
+	imlib_context_set_color((int)r, (int)g, (int)b, (int)alpha);
+	imlib_image_fill_rectangle(0, 0, ww, wh);
+
+	/* Blend tint over background (merge_alpha=1 uses tint's alpha channel) */
+	imlib_context_set_image(bg);
+	imlib_context_set_blend(1);
+	imlib_blend_image_onto_image(tint, 1, 0, 0, ww, wh, 0, 0, ww, wh);
+
+	/* Render composited result to canvas */
+	imlib_context_set_visual(dvis);
+	imlib_context_set_colormap(dcmap);
+	imlib_context_set_drawable(canvas);
+	imlib_render_image_on_drawable(0, 0);
+
+	imlib_free_image(); /* bg is current context image */
+
+	imlib_context_set_image(tint);
+	imlib_free_image();
+}
+
+/*
+ * Draw the alt-tab overlay using only plain Xlib + Xft.
+ * Everything uses DefaultDepth/DefaultVisual so no depth mismatch is possible.
+ * Canvas pixmap → XSetWindowBackgroundPixmap → XClearWindow (same as tagwin).
+ */
+void
+drawaltpreview(void)
+{
+	int rows, cols, i, row, col;
+	Monitor *pm;
+	int winw, winh, cellw, cellh, pad, labelh;
+	int tx, ty, tw, th;
+	char label[64];
+	Pixmap canvas;
+	GC gc;
+	XGCValues gcv;
+	XSetWindowAttributes wa;
+	XftDraw *xd;
+	XftColor clr_normbg, clr_normfg, clr_selbg, clr_selfg, clr_hidbg;
+	XColor xclr;
+	unsigned long px_normbg, px_selbg, px_selborder, px_hidbg;
+	int fonth;
+
+	if (!atab_active || atab_count == 0) return;
+	pm = primarymon();
+
+	calculategrid(atab_count, &rows, &cols);
+
+	fonth  = drw->fonts->h;
+	pad    = 14;
+	labelh = fonth + 10;
+	cellw  = pm->mw / scalepreview + pad;
+	cellh  = pm->mh / scalepreview + labelh + pad;
+	winw   = cols * cellw + pad;
+	winh   = rows * cellh + pad;
+
+	/* Allocate Xft colors against DefaultVisual/DefaultColormap */
+	atab_alloc_color(&clr_normbg, normbgcolor);
+	atab_alloc_color(&clr_normfg, normfgcolor);
+	atab_alloc_color(&clr_selbg,  selbgcolor);
+	atab_alloc_color(&clr_selfg,  selfgcolor);
+	atab_alloc_color(&clr_hidbg,  hidbgcolor);
+
+	/* pixel values for XFillRectangle (plain GC drawing) */
+	XParseColor(dpy, DefaultColormap(dpy, screen), normbgcolor, &xclr);
+	XAllocColor(dpy, DefaultColormap(dpy, screen), &xclr);
+	px_normbg = xclr.pixel;
+
+	XParseColor(dpy, DefaultColormap(dpy, screen), selbgcolor, &xclr);
+	XAllocColor(dpy, DefaultColormap(dpy, screen), &xclr);
+	px_selbg = xclr.pixel;
+
+	XParseColor(dpy, DefaultColormap(dpy, screen), selbordercolor, &xclr);
+	XAllocColor(dpy, DefaultColormap(dpy, screen), &xclr);
+	px_selborder = xclr.pixel;
+
+	XParseColor(dpy, DefaultColormap(dpy, screen), hidbgcolor, &xclr);
+	XAllocColor(dpy, DefaultColormap(dpy, screen), &xclr);
+	px_hidbg = xclr.pixel;
+
+	/* compute overlay window position */
+	int win_x = pm->mx + (pm->mw - winw) / 2;
+	int win_y = pm->my + (pm->mh - winh) / 2;
+
+	/* create/reposition overlay window */
+	if (!atab_win) {
+		wa.override_redirect = True;
+		wa.background_pixel  = px_normbg;
+		wa.border_pixel      = px_selborder;
+		wa.colormap          = DefaultColormap(dpy, screen);
+		wa.event_mask        = ExposureMask | KeyPressMask;
+		atab_win = XCreateWindow(dpy, root,
+		    win_x, win_y,
+		    winw, winh, 2,
+		    DefaultDepth(dpy, screen), InputOutput, DefaultVisual(dpy, screen),
+		    CWOverrideRedirect | CWBackPixel | CWBorderPixel |
+		    CWColormap | CWEventMask, &wa);
+	} else {
+		XMoveResizeWindow(dpy, atab_win, win_x, win_y, winw, winh);
+	}
+
+	/* off-screen canvas at DefaultDepth */
+	canvas = XCreatePixmap(dpy, RootWindow(dpy, screen),
+	    winw, winh, DefaultDepth(dpy, screen));
+	gc = XCreateGC(dpy, canvas, 0, &gcv);
+
+	/*
+	 * Fake-transparent background: grab the screen behind the overlay and
+	 * tint it with normbgcolor at ~100/255 opacity (~39% tint = ~61% see-through).
+	 */
+	atab_blend_background(canvas, win_x, win_y, winw, winh, 100);
+
+	/* Xft context for text — DefaultVisual/DefaultColormap, safe */
+	xd = XftDrawCreate(dpy, canvas, DefaultVisual(dpy, screen),
+	    DefaultColormap(dpy, screen));
+
+	for (i = 0; i < atab_count; i++) {
+		Workspace *ws = &atab_ws[i];
+		int selected  = (i == atab_sel);
+
+		row = i / cols;
+		col = i % cols;
+		tx  = pad / 2 + col * cellw;
+		ty  = pad / 2 + row * cellh;
+		tw  = cellw - pad / 2;
+		th  = cellh - labelh - pad / 2;
+
+		/* cell background */
+		XSetForeground(dpy, gc, selected ? px_selbg : px_hidbg);
+		XFillRectangle(dpy, canvas, gc, tx, ty, tw, th + labelh);
+
+		/* selection border (double-line) */
+		if (selected) {
+			XSetForeground(dpy, gc, px_selborder);
+			XDrawRectangle(dpy, canvas, gc, tx, ty, tw - 1, th + labelh - 1);
+			XDrawRectangle(dpy, canvas, gc, tx + 1, ty + 1, tw - 3, th + labelh - 3);
+		}
+
+		/* thumbnail */
+		if (ws->thumbnail && ws->tw > 0 && ws->th > 0) {
+			int ox = tx + 2 + (tw - 4 - ws->tw) / 2;
+			int oy = ty + 2 + (th - 4 - ws->th) / 2;
+			if (ox < tx + 2) ox = tx + 2;
+			if (oy < ty + 2) oy = ty + 2;
+			XCopyArea(dpy, ws->thumbnail, canvas, gc,
+			    0, 0, ws->tw, ws->th, ox, oy);
+		} else {
+			/* placeholder */
+			XSetForeground(dpy, gc, px_normbg);
+			XFillRectangle(dpy, canvas, gc, tx + 2, ty + 2, tw - 4, th - 4);
+		}
+
+		/* label */
+		snprintf(label, sizeof(label), "Monitor %d  Tag %d",
+		    ws->mon->num + 1, ws->tagidx + 1);
+		{
+			XftColor *fg = selected ? &clr_selfg : &clr_normfg;
+			int lx = tx + 6;
+			int ly = ty + th + (labelh + fonth) / 2 - 2;
+			XftDrawStringUtf8(xd, fg, drw->fonts->xfont,
+			    lx, ly, (XftChar8 *)label, strlen(label));
+		}
+	}
+
+	XftDrawDestroy(xd);
+
+	/* blit canvas → window */
+	XSetWindowBackgroundPixmap(dpy, atab_win, canvas);
+	XClearWindow(dpy, atab_win);
+	XFlush(dpy);
+
+	XFreeGC(dpy, gc);
+	XFreePixmap(dpy, canvas);
+
+	/* free Xft colors */
+	XftColorFree(dpy, DefaultVisual(dpy, screen), DefaultColormap(dpy, screen), &clr_normbg);
+	XftColorFree(dpy, DefaultVisual(dpy, screen), DefaultColormap(dpy, screen), &clr_normfg);
+	XftColorFree(dpy, DefaultVisual(dpy, screen), DefaultColormap(dpy, screen), &clr_selbg);
+	XftColorFree(dpy, DefaultVisual(dpy, screen), DefaultColormap(dpy, screen), &clr_selfg);
+	XftColorFree(dpy, DefaultVisual(dpy, screen), DefaultColormap(dpy, screen), &clr_hidbg);
+}
+
+/*
+ * Force-populate any missing tagmap[] entries for all monitors and tags
+ * that have clients.  For non-visible tags we temporarily flip the tagset,
+ * let X redraw (arrange + two XSync calls), capture, then restore.
+ * This guarantees every occupied tag always has a thumbnail.
+ *
+ * We only do the expensive temp-switch for tags with no existing tagmap.
+ * Tags that already have a valid tagmap are left untouched.
+ */
+static void
+force_populate_tagmaps(void)
+{
+	Monitor *m;
+	Client *c;
+	int i;
+	unsigned int occ;
+	Visual    *dvis  = DefaultVisual(dpy, screen);
+	Colormap   dcmap = DefaultColormap(dpy, screen);
+	Window     droot = RootWindow(dpy, screen);
+	int        ddepth = DefaultDepth(dpy, screen);
+
+	for (m = mons; m; m = m->next) {
+		/* build occupancy mask for this monitor */
+		occ = 0;
+		for (c = m->clients; c; c = c->next)
+			occ |= c->tags;
+
+		for (i = 0; i < (int)LENGTH(tags); i++) {
+			unsigned int mask = 1u << i;
+			if (!(occ & mask)) continue;       /* no clients here */
+			if (m->tagmap[i])   continue;       /* already have a screenshot */
+
+			if (m->tagset[m->seltags] == mask) {
+				/* Tag is already visible — live capture */
+				Imlib_Image img;
+				int tw = m->mw / scalepreview;
+				int th = m->mh / scalepreview;
+				XSetErrorHandler(xerrordummy);
+				imlib_context_set_display(dpy);
+				imlib_context_set_visual(dvis);
+				imlib_context_set_colormap(dcmap);
+				imlib_context_set_drawable(droot);
+				imlib_context_set_anti_alias(0);
+				imlib_context_set_dither(0);
+				img = imlib_create_image_from_drawable(0,
+				    m->mx, m->my, m->mw, m->mh, 1);
+				XSetErrorHandler(xerror);
+				if (!img) continue;
+				imlib_context_set_image(img);
+				m->tagmap[i] = XCreatePixmap(dpy, droot, tw, th, ddepth);
+				if (!m->tagmap[i]) { imlib_free_image(); continue; }
+				imlib_context_set_visual(dvis);
+				imlib_context_set_colormap(dcmap);
+				imlib_context_set_drawable(m->tagmap[i]);
+				imlib_render_image_part_on_drawable_at_size(
+				    0, 0, m->mw, m->mh, 0, 0, tw, th);
+				imlib_free_image();
+			} else {
+				/* Tag not visible — temporarily switch to it, capture, restore */
+				unsigned int saved_tagset = m->tagset[m->seltags];
+				Imlib_Image img;
+				int tw = m->mw / scalepreview;
+				int th = m->mh / scalepreview;
+
+				/* Switch tagset and rearrange so windows appear on screen */
+				m->tagset[m->seltags] = mask;
+				arrange(m);
+				/* Two syncs: first flushes commands, second waits for expose events */
+				XSync(dpy, False);
+				XSync(dpy, False);
+
+				XSetErrorHandler(xerrordummy);
+				imlib_context_set_display(dpy);
+				imlib_context_set_visual(dvis);
+				imlib_context_set_colormap(dcmap);
+				imlib_context_set_drawable(droot);
+				imlib_context_set_anti_alias(0);
+				imlib_context_set_dither(0);
+				img = imlib_create_image_from_drawable(0,
+				    m->mx, m->my, m->mw, m->mh, 1);
+				XSetErrorHandler(xerror);
+
+				/* Restore original tagset */
+				m->tagset[m->seltags] = saved_tagset;
+				arrange(m);
+				XSync(dpy, False);
+
+				if (!img) continue;
+				imlib_context_set_image(img);
+				m->tagmap[i] = XCreatePixmap(dpy, droot, tw, th, ddepth);
+				if (!m->tagmap[i]) { imlib_free_image(); continue; }
+				imlib_context_set_visual(dvis);
+				imlib_context_set_colormap(dcmap);
+				imlib_context_set_drawable(m->tagmap[i]);
+				imlib_render_image_part_on_drawable_at_size(
+				    0, 0, m->mw, m->mh, 0, 0, tw, th);
+				imlib_free_image();
+			}
+		}
+	}
+}
+
+void
+alttab(const Arg *arg)
+{
+	int i;
+
+	scanworkspaces();
+	if (atab_count < 2) return;
+
+	/* Hide any existing overlay so it doesn't appear in screenshots */
+	if (atab_win) {
+		XUnmapWindow(dpy, atab_win);
+		XSync(dpy, False);
+	}
+
+	/* Ensure every occupied tag has a screenshot before we open the overlay */
+	force_populate_tagmaps();
+
+	atab_origidx = 0;
+	for (i = 0; i < atab_count; i++)
+		captureworkspace(i);
+
+	atab_sel    = 1 % atab_count;
+	atab_active = 1;
+
+	drawaltpreview();
+	XMapRaised(dpy, atab_win);
+	XFlush(dpy);
+	XSetInputFocus(dpy, atab_win, RevertToPointerRoot, CurrentTime);
+	XGrabKeyboard(dpy, root, True, GrabModeAsync, GrabModeAsync, CurrentTime);
+}
+
+void
+alttabprev(const Arg *arg)
+{
+	int i;
+
+	scanworkspaces();
+	if (atab_count < 2) return;
+
+	/* Hide any existing overlay so it doesn't appear in screenshots */
+	if (atab_win) {
+		XUnmapWindow(dpy, atab_win);
+		XSync(dpy, False);
+	}
+
+	/* Ensure every occupied tag has a screenshot before we open the overlay */
+	force_populate_tagmaps();
+
+	atab_origidx = 0;
+	for (i = 0; i < atab_count; i++)
+		captureworkspace(i);
+
+	atab_sel    = atab_count - 1;
+	atab_active = 1;
+
+	drawaltpreview();
+	XMapRaised(dpy, atab_win);
+	XFlush(dpy);
+	XSetInputFocus(dpy, atab_win, RevertToPointerRoot, CurrentTime);
+	XGrabKeyboard(dpy, root, True, GrabModeAsync, GrabModeAsync, CurrentTime);
+}
+
+void
+alttabend(int commit)
+{
+	Workspace *ws;
+
+	atab_active = 0;
+	XUngrabKeyboard(dpy, CurrentTime);
+
+	if (atab_win)
+		XUnmapWindow(dpy, atab_win);
+
+	/*
+	 * Flush + sync so X removes the overlay from the screen before
+	 * switchtag() (called inside view()) grabs a screenshot.
+	 * Without this, the alt-tab window itself gets baked into tagmap[].
+	 */
+	XSync(dpy, False);
+
+	atab_committing = 1;
+	if (commit && atab_count > 0) {
+		ws = &atab_ws[atab_sel];
+		if (ws->mon != selmon) {
+			unfocus(selmon->sel, 0);
+			selmon = ws->mon;
+			focus(NULL);
+		}
+		view(&(const Arg){.ui = ws->tagmask});
+	} else if (!commit && atab_count > 0) {
+		ws = &atab_ws[atab_origidx];
+		if (ws->mon != selmon) {
+			unfocus(selmon->sel, 0);
+			selmon = ws->mon;
+			focus(NULL);
+		}
+		if (selmon->tagset[selmon->seltags] != ws->tagmask)
+			view(&(const Arg){.ui = ws->tagmask});
+	}
+	atab_committing = 0;
+
+	focus(NULL);
+	arrange(selmon);
+}
+
+void
+keyrelease(XEvent *e)
+{
+	XKeyEvent *ev = &e->xkey;
+	KeySym keysym = XKeycodeToKeysym(dpy, (KeyCode)ev->keycode, 0);
+
+	if (atab_active &&
+	    (keysym == XK_Alt_L || keysym == XK_Alt_R ||
+	     keysym == XK_Super_L || keysym == XK_Super_R)) {
+		alttabend(1);
+	}
 }

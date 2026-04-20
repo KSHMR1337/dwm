@@ -12,3 +12,4 @@ config.h
 *.swo
 *~
 .DS_Store
+.gitignore

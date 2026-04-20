@@ -11,6 +11,11 @@ static const int showbar = 1; /* 0 means no bar */
 static const int topbar = 1;  /* 0 means bottom bar */
 static const int scalepreview = 4;      /* preview scale factor (mw/scalepreview wide) */
 static const int tag_preview = 1;       /* 1 means enable tag preview, 0 is off */
+/* alt-tab workspace preview keybindings (change to any mod+key combo) */
+#define ALTTAB_MOD     MODKEY
+#define ALTTAB_KEY     XK_Tab
+#define ALTTABPREV_MOD MODKEY
+#define ALTTABPREV_KEY XK_Delete
 static const int user_bh = 6; /* 2 is the default spacing around the bar's font */
 static const int vertpad = 10; /* vertical padding of bar */
 static const int sidepad = 15; /* horizontal padding of bar */
@@ -134,7 +139,8 @@ static const Key keys[] = {
     { MODKEY|ShiftMask|ControlMask,      XK_j,                     movestack,      {.i = +1} },
     { MODKEY|ShiftMask|ControlMask,      XK_k,                     movestack,      {.i = -1} },
     { MODKEY,                            XK_Return,                zoom,           {0} },
-    { MODKEY,                            XK_Tab,                   view,           {0} },
+    { ALTTAB_MOD,                         ALTTAB_KEY,               alttab,         {0} },
+    { ALTTABPREV_MOD,                    ALTTABPREV_KEY,           alttabprev,     {0} },
     { MODKEY|ShiftMask,                  XK_c,                     killclient,     {0} },
     { MODKEY,                            XK_t,                     setlayout,      {.v = &layouts[0]} },
     { MODKEY,                            XK_f,                     setlayout,      {.v = &layouts[1]} },
