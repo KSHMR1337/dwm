@@ -3293,7 +3293,7 @@ scanworkspaces(void)
 		for (m = mons; m && n < ATAB_MAX_WS; m = m->next) {
 			if (pass == 0 && m != selmon) continue;
 			if (pass == 1 && m == selmon) continue;
-			unsigned int curtag = selmon->tagset[selmon->seltags];
+			unsigned int curtag = m->tagset[m->seltags];
 			for (i = 0; i < (int)LENGTH(tags) && n < ATAB_MAX_WS; i++) {
 				unsigned int mask = 1u << i;
 				if (m == selmon && mask == curtag) continue;
@@ -3440,7 +3440,10 @@ atab_blend_background(Pixmap canvas, int wx, int wy, int ww, int wh,
 		return;
 	}
 
-	sscanf(normbgcolor, "#%02x%02x%02x", &r, &g, &b);
+	if (sscanf(normbgcolor, "#%02x%02x%02x", &r, &g, &b) != 3) {
+		/* Malformed color, use default gray */
+		r = g = b = 128;
+	}
 
 	imlib_context_set_image(tint);
 	imlib_image_set_has_alpha(1);
@@ -3489,6 +3492,7 @@ drawaltpreview(void)
 
 	if (!atab_active || atab_count == 0) return;
 	pm = primarymon();
+	if (!pm) return;
 
 	calculategrid(atab_count, &rows, &cols);
 
@@ -3528,10 +3532,29 @@ drawaltpreview(void)
 	int win_x = pm->mx + (pm->mw - winw) / 2;
 	int win_y = pm->my + (pm->mh - winh) / 2;
 
-	/* create/reposition overlay window */
+	/* off-screen canvas at DefaultDepth */
+	canvas = XCreatePixmap(dpy, RootWindow(dpy, screen),
+	    winw, winh, DefaultDepth(dpy, screen));
+	if (!canvas) return;
+	gc = XCreateGC(dpy, canvas, 0, &gcv);
+	if (!gc) {
+		XFreePixmap(dpy, canvas);
+		return;
+	}
+
+	/*
+	 * CRITICAL: Capture background BEFORE creating/moving the window.
+	 * This ensures we grab the actual desktop at (win_x, win_y) rather than
+	 * compositor artifacts from the window that's already positioned there.
+	 * Fake-transparent background: grab the screen behind the overlay and
+	 * tint it with normbgcolor at ~100/255 opacity (~39% tint = ~61% see-through).
+	 */
+	atab_blend_background(canvas, win_x, win_y, winw, winh, 100);
+
+	/* create/reposition overlay window AFTER background capture */
 	if (!atab_win) {
 		wa.override_redirect = True;
-		wa.background_pixel  = px_normbg;
+		wa.background_pixmap = ParentRelative;  /* prevent color flash */
 		wa.border_pixel      = px_selborder;
 		wa.colormap          = DefaultColormap(dpy, screen);
 		wa.event_mask        = ExposureMask | KeyPressMask;
@@ -3539,7 +3562,7 @@ drawaltpreview(void)
 		    win_x, win_y,
 		    winw, winh, 2,
 		    DefaultDepth(dpy, screen), InputOutput, DefaultVisual(dpy, screen),
-		    CWOverrideRedirect | CWBackPixel | CWBorderPixel |
+		    CWOverrideRedirect | CWBackPixmap | CWBorderPixel |
 		    CWColormap | CWEventMask, &wa);
 		{
 			Atom wtype = XInternAtom(dpy, "_NET_WM_WINDOW_TYPE", False);
@@ -3551,20 +3574,28 @@ drawaltpreview(void)
 		XMoveResizeWindow(dpy, atab_win, win_x, win_y, winw, winh);
 	}
 
-	/* off-screen canvas at DefaultDepth */
-	canvas = XCreatePixmap(dpy, RootWindow(dpy, screen),
-	    winw, winh, DefaultDepth(dpy, screen));
-	gc = XCreateGC(dpy, canvas, 0, &gcv);
-
 	/*
-	 * Fake-transparent background: grab the screen behind the overlay and
-	 * tint it with normbgcolor at ~100/255 opacity (~39% tint = ~61% see-through).
+	 * Set opacity AFTER window creation/resize and BEFORE mapping.
+	 * Always refresh this property (even on reuse) to ensure compositor
+	 * picks up the correct value, especially after alttabend() set it to 0.
 	 */
-	atab_blend_background(canvas, win_x, win_y, winw, winh, 100);
+	{
+		Atom opacity_atom = XInternAtom(dpy, "_NET_WM_WINDOW_OPACITY", False);
+		unsigned long opacity = (unsigned long)(0.85 * 0xFFFFFFFF);
+		XChangeProperty(dpy, atab_win, opacity_atom, XA_CARDINAL, 32,
+		                PropModeReplace, (unsigned char *)&opacity, 1);
+	}
 
 	/* Xft context for text — DefaultVisual/DefaultColormap, safe */
 	xd = XftDrawCreate(dpy, canvas, DefaultVisual(dpy, screen),
 	    DefaultColormap(dpy, screen));
+	if (!xd) {
+		XFreeGC(dpy, gc);
+		XFreePixmap(dpy, canvas);
+		return;
+	}
+
+	int remainder = atab_count % cols;
 
 	for (i = 0; i < atab_count; i++) {
 		Workspace *ws = &atab_ws[i];
@@ -3572,7 +3603,9 @@ drawaltpreview(void)
 
 		row = i / cols;
 		col = i % cols;
-		tx  = pad / 2 + col * cellw;
+		int cells_this_row = (row == rows - 1 && remainder != 0) ? remainder : cols;
+		int x_offset = (cols - cells_this_row) * cellw / 2;
+		tx  = pad / 2 + x_offset + col * cellw;
 		ty  = pad / 2 + row * cellh;
 		tw  = cellw - pad / 2;
 		th  = cellh - labelh - pad / 2;
@@ -3630,6 +3663,12 @@ drawaltpreview(void)
 	XftColorFree(dpy, DefaultVisual(dpy, screen), DefaultColormap(dpy, screen), &clr_selbg);
 	XftColorFree(dpy, DefaultVisual(dpy, screen), DefaultColormap(dpy, screen), &clr_selfg);
 	XftColorFree(dpy, DefaultVisual(dpy, screen), DefaultColormap(dpy, screen), &clr_hidbg);
+
+	/* free X11 color cells allocated with XAllocColor */
+	{
+		unsigned long pixels[4] = {px_normbg, px_selbg, px_selborder, px_hidbg};
+		XFreeColors(dpy, DefaultColormap(dpy, screen), pixels, 4, 0);
+	}
 }
 
 /*
