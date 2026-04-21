@@ -1006,8 +1006,6 @@ void sigstatusbar(const Arg *arg) {
 
 void drawbar(Monitor *m) {
   int x, w, tw = 0, n = 0, scm;
-  int boxs = drw->fonts->h / 9;
-  int boxw = drw->fonts->h / 6 + 2;
   unsigned int i, occ = 0, urg = 0;
   Client *c;
   if (!m->showbar)
@@ -1189,8 +1187,7 @@ void focusstackhid(const Arg *arg) { focusstack(arg->i, 1); }
 
 void focusstack(int inc, int hid) {
   Client *c = NULL, *i;
-  // if no client selected AND exclude hidden client; if client selected but
-  // fullscreened
+  /* if no client selected AND exclude hidden client; if client selected but fullscreened */
   if ((!selmon->sel && !hid) ||
       (selmon->sel && selmon->sel->isfullscreen && lockfullscreen))
     return;
@@ -1368,11 +1365,11 @@ void hidewin(Client *c) {
   Window w = c->win;
   static XWindowAttributes ra, ca;
 
-  // more or less taken directly from blackbox's hide() function
+  /* more or less taken directly from blackbox's hide() function */
   XGrabServer(dpy);
   XGetWindowAttributes(dpy, root, &ra);
   XGetWindowAttributes(dpy, w, &ca);
-  // prevent UnmapNotify events
+  /* prevent UnmapNotify events */
   XSelectInput(dpy, root, ra.your_event_mask & ~SubstructureNotifyMask);
   XSelectInput(dpy, w, ca.your_event_mask & ~StructureNotifyMask);
   XUnmapWindow(dpy, w);
@@ -1776,7 +1773,7 @@ void propertynotify(XEvent *e) {
 }
 
 void quit(const Arg *arg) {
-  // fix: reloading dwm keeps all the hidden clients hidden
+  /* fix: reloading dwm keeps all the hidden clients hidden */
   Monitor *m;
   Client *c;
   for (m = mons; m; m = m->next) {
@@ -3274,13 +3271,17 @@ scanworkspaces(void)
 	Monitor *m;
 	Client *c;
 	int i, n = 0;
+	int pass;
+	unsigned int curtag, mask;
+	int cnt, tidx;
 
 	atab_count = 0;
 
 	/* slot 0: selmon's current tag */
 	{
-		unsigned int curtag = selmon->tagset[selmon->seltags];
-		int cnt = 0, tidx = 0;
+		curtag = selmon->tagset[selmon->seltags];
+		cnt = 0;
+		tidx = 0;
 		for (c = selmon->clients; c; c = c->next)
 			if (c->tags & curtag) cnt++;
 		for (i = 0; i < (int)LENGTH(tags); i++)
@@ -3289,15 +3290,15 @@ scanworkspaces(void)
 			atab_ws[n++] = (Workspace){selmon, curtag, tidx, cnt, 0, 0, 0};
 	}
 
-	for (int pass = 0; pass < 2 && n < ATAB_MAX_WS; pass++) {
+	for (pass = 0; pass < 2 && n < ATAB_MAX_WS; pass++) {
 		for (m = mons; m && n < ATAB_MAX_WS; m = m->next) {
 			if (pass == 0 && m != selmon) continue;
 			if (pass == 1 && m == selmon) continue;
-			unsigned int curtag = m->tagset[m->seltags];
+			curtag = m->tagset[m->seltags];
 			for (i = 0; i < (int)LENGTH(tags) && n < ATAB_MAX_WS; i++) {
-				unsigned int mask = 1u << i;
+				mask = 1u << i;
 				if (m == selmon && mask == curtag) continue;
-				int cnt = 0;
+				cnt = 0;
 				for (c = m->clients; c; c = c->next)
 					if (c->tags & mask) cnt++;
 				if (cnt == 0) continue;
@@ -3407,64 +3408,102 @@ atab_alloc_color(XftColor *clr, const char *hex)
  * We use ~104/255 (~41%) so the desktop is clearly visible through the panel.
  */
 static void
-atab_blend_background(Pixmap canvas, int wx, int wy, int ww, int wh,
-    unsigned char alpha)
+atab_blend_background(Pixmap canvas, int x, int y, int w, int h, int alpha)
 {
-	Visual    *dvis  = DefaultVisual(dpy, screen);
-	Colormap   dcmap = DefaultColormap(dpy, screen);
-	Window     droot = RootWindow(dpy, screen);
-	Imlib_Image bg, tint;
-	unsigned int r = 0, g = 0, b = 0;
+	Imlib_Image img, blend;
+	DATA32 *data;
+	int i, npixels;
+	unsigned int r_bg, g_bg, b_bg;
+	unsigned int r, g, b, a_px;
+	XColor xclr;
+	Visual *dvis;
+	Colormap dcmap;
 
+	dvis = DefaultVisual(dpy, screen);
+	dcmap = DefaultColormap(dpy, screen);
+
+	/* Parse normbgcolor to get RGB values */
+	if (!XParseColor(dpy, dcmap, normbgcolor, &xclr))
+		return;
+	r_bg = xclr.red >> 8;
+	g_bg = xclr.green >> 8;
+	b_bg = xclr.blue >> 8;
+
+	/* Capture screen region */
 	XSetErrorHandler(xerrordummy);
-
 	imlib_context_set_display(dpy);
 	imlib_context_set_visual(dvis);
 	imlib_context_set_colormap(dcmap);
-	imlib_context_set_drawable(droot);
+	imlib_context_set_drawable(RootWindow(dpy, screen));
 	imlib_context_set_anti_alias(0);
 	imlib_context_set_dither(0);
 
-	/* Grab screen pixels behind the overlay */
-	bg = imlib_create_image_from_drawable(0, wx, wy, ww, wh, 1);
-
+	img = imlib_create_image_from_drawable(0, x, y, w, h, 1);
 	XSetErrorHandler(xerror);
 
-	if (!bg) return;
-
-	/* Create solid tint image with alpha */
-	tint = imlib_create_image(ww, wh);
-	if (!tint) {
-		imlib_context_set_image(bg);
-		imlib_free_image();
+	if (!img)
 		return;
+
+	/* Clone the image for blending */
+	imlib_context_set_image(img);
+	blend = imlib_clone_image();
+	imlib_free_image();
+
+	if (!blend)
+		return;
+
+	/* Blend normbgcolor on top at alpha opacity */
+	imlib_context_set_image(blend);
+	data = imlib_image_get_data();
+	npixels = w * h;
+
+	for (i = 0; i < npixels; i++) {
+		r = (data[i] >> 16) & 0xff;
+		g = (data[i] >> 8) & 0xff;
+		b = data[i] & 0xff;
+
+		/* Blend: result = bg * alpha + screen * (255 - alpha) / 255 */
+		r = (r_bg * alpha + r * (255 - alpha)) / 255;
+		g = (g_bg * alpha + g * (255 - alpha)) / 255;
+		b = (b_bg * alpha + b * (255 - alpha)) / 255;
+
+		a_px = 0xff;
+		data[i] = (a_px << 24) | (r << 16) | (g << 8) | b;
 	}
 
-	if (sscanf(normbgcolor, "#%02x%02x%02x", &r, &g, &b) != 3) {
-		/* Malformed color, use default gray */
-		r = g = b = 128;
-	}
+	imlib_image_put_back_data(data);
 
-	imlib_context_set_image(tint);
-	imlib_image_set_has_alpha(1);
-	imlib_context_set_color((int)r, (int)g, (int)b, (int)alpha);
-	imlib_image_fill_rectangle(0, 0, ww, wh);
-
-	/* Blend tint over background (merge_alpha=1 uses tint's alpha channel) */
-	imlib_context_set_image(bg);
-	imlib_context_set_blend(1);
-	imlib_blend_image_onto_image(tint, 1, 0, 0, ww, wh, 0, 0, ww, wh);
-
-	/* Render composited result to canvas */
+	/* Render onto canvas */
 	imlib_context_set_visual(dvis);
 	imlib_context_set_colormap(dcmap);
 	imlib_context_set_drawable(canvas);
 	imlib_render_image_on_drawable(0, 0);
-
-	imlib_free_image(); /* bg is current context image */
-
-	imlib_context_set_image(tint);
 	imlib_free_image();
+}
+
+/*
+ * Draw a rounded rectangle border.
+ * radius: corner radius in pixels
+ */
+static void
+draw_rounded_rect_border(Display *dpy, Drawable d, GC gc,
+                         int x, int y, int w, int h, int radius)
+{
+	int diameter;
+
+	diameter = radius * 2;
+
+	/* Draw four corner arcs */
+	XDrawArc(dpy, d, gc, x, y, diameter, diameter, 90 * 64, 90 * 64);
+	XDrawArc(dpy, d, gc, x + w - diameter - 1, y, diameter, diameter, 0, 90 * 64);
+	XDrawArc(dpy, d, gc, x, y + h - diameter - 1, diameter, diameter, 180 * 64, 90 * 64);
+	XDrawArc(dpy, d, gc, x + w - diameter - 1, y + h - diameter - 1, diameter, diameter, 270 * 64, 90 * 64);
+
+	/* Draw four connecting lines */
+	XDrawLine(dpy, d, gc, x + radius, y, x + w - radius - 1, y);
+	XDrawLine(dpy, d, gc, x + radius, y + h - 1, x + w - radius - 1, y + h - 1);
+	XDrawLine(dpy, d, gc, x, y + radius, x, y + h - radius - 1);
+	XDrawLine(dpy, d, gc, x + w - 1, y + radius, x + w - 1, y + h - radius - 1);
 }
 
 /*
@@ -3489,6 +3528,16 @@ drawaltpreview(void)
 	XColor xclr;
 	unsigned long px_normbg, px_selbg, px_selborder, px_hidbg;
 	int fonth;
+	int win_x, win_y;
+	int remainder;
+	Workspace *ws;
+	int selected;
+	int cells_this_row;
+	int x_offset;
+	Atom opacity_atom;
+	unsigned long opacity;
+	XftColor *fg;
+	int lx, ly;
 
 	if (!atab_active || atab_count == 0) return;
 	pm = primarymon();
@@ -3529,8 +3578,8 @@ drawaltpreview(void)
 	px_hidbg = xclr.pixel;
 
 	/* compute overlay window position */
-	int win_x = pm->mx + (pm->mw - winw) / 2;
-	int win_y = pm->my + (pm->mh - winh) / 2;
+	win_x = pm->mx + (pm->mw - winw) / 2;
+	win_y = pm->my + (pm->mh - winh) / 2;
 
 	/* off-screen canvas at DefaultDepth */
 	canvas = XCreatePixmap(dpy, RootWindow(dpy, screen),
@@ -3542,27 +3591,20 @@ drawaltpreview(void)
 		return;
 	}
 
-	/*
-	 * CRITICAL: Capture background BEFORE creating/moving the window.
-	 * This ensures we grab the actual desktop at (win_x, win_y) rather than
-	 * compositor artifacts from the window that's already positioned there.
-	 * Fake-transparent background: grab the screen behind the overlay and
-	 * tint it with normbgcolor at ~100/255 opacity (~39% tint = ~61% see-through).
-	 */
-	atab_blend_background(canvas, win_x, win_y, winw, winh, 100);
+	/* Render blended transparent background */
+	atab_blend_background(canvas, win_x, win_y, winw, winh, 104);
 
 	/* create/reposition overlay window AFTER background capture */
 	if (!atab_win) {
 		wa.override_redirect = True;
 		wa.background_pixmap = ParentRelative;  /* prevent color flash */
-		wa.border_pixel      = px_selborder;
 		wa.colormap          = DefaultColormap(dpy, screen);
 		wa.event_mask        = ExposureMask | KeyPressMask;
 		atab_win = XCreateWindow(dpy, root,
 		    win_x, win_y,
-		    winw, winh, 2,
+		    winw, winh, 0,
 		    DefaultDepth(dpy, screen), InputOutput, DefaultVisual(dpy, screen),
-		    CWOverrideRedirect | CWBackPixmap | CWBorderPixel |
+		    CWOverrideRedirect | CWBackPixmap |
 		    CWColormap | CWEventMask, &wa);
 		{
 			Atom wtype = XInternAtom(dpy, "_NET_WM_WINDOW_TYPE", False);
@@ -3580,8 +3622,8 @@ drawaltpreview(void)
 	 * picks up the correct value, especially after alttabend() set it to 0.
 	 */
 	{
-		Atom opacity_atom = XInternAtom(dpy, "_NET_WM_WINDOW_OPACITY", False);
-		unsigned long opacity = (unsigned long)(0.85 * 0xFFFFFFFF);
+		opacity_atom = XInternAtom(dpy, "_NET_WM_WINDOW_OPACITY", False);
+		opacity = (unsigned long)(0.85 * 0xFFFFFFFF);
 		XChangeProperty(dpy, atab_win, opacity_atom, XA_CARDINAL, 32,
 		                PropModeReplace, (unsigned char *)&opacity, 1);
 	}
@@ -3595,30 +3637,41 @@ drawaltpreview(void)
 		return;
 	}
 
-	int remainder = atab_count % cols;
+	/* Draw border around the entire window (borderpx * 2 width) */
+	XSetForeground(dpy, gc, px_selborder);
+	XDrawRectangle(dpy, canvas, gc, 0, 0, winw - 1, winh - 1);
+	XDrawRectangle(dpy, canvas, gc, borderpx, borderpx,
+	    winw - 1 - borderpx * 2, winh - 1 - borderpx * 2);
+
+	remainder = atab_count % cols;
 
 	for (i = 0; i < atab_count; i++) {
-		Workspace *ws = &atab_ws[i];
-		int selected  = (i == atab_sel);
+		ws = &atab_ws[i];
+		selected = (i == atab_sel);
 
 		row = i / cols;
 		col = i % cols;
-		int cells_this_row = (row == rows - 1 && remainder != 0) ? remainder : cols;
-		int x_offset = (cols - cells_this_row) * cellw / 2;
+		cells_this_row = (row == rows - 1 && remainder != 0) ? remainder : cols;
+		x_offset = (cols - cells_this_row) * cellw / 2;
 		tx  = pad / 2 + x_offset + col * cellw;
 		ty  = pad / 2 + row * cellh;
 		tw  = cellw - pad / 2;
 		th  = cellh - labelh - pad / 2;
 
-		/* cell background */
-		XSetForeground(dpy, gc, selected ? px_selbg : px_hidbg);
-		XFillRectangle(dpy, canvas, gc, tx, ty, tw, th + labelh);
-
-		/* selection border (double-line) */
+		/* rounded border for preview box (double border for selection) */
+		XSetForeground(dpy, gc, px_selborder);
 		if (selected) {
-			XSetForeground(dpy, gc, px_selborder);
-			XDrawRectangle(dpy, canvas, gc, tx, ty, tw - 1, th + labelh - 1);
-			XDrawRectangle(dpy, canvas, gc, tx + 1, ty + 1, tw - 3, th + labelh - 3);
+			/* double rounded border for selected cell */
+			draw_rounded_rect_border(dpy, canvas, gc, tx, ty,
+			    tw - 1, th + labelh - 1, cornerradius);
+			draw_rounded_rect_border(dpy, canvas, gc,
+			    tx + borderpx, ty + borderpx,
+			    tw - 1 - borderpx * 2, th + labelh - 1 - borderpx * 2,
+			    cornerradius > borderpx ? cornerradius - borderpx : 1);
+		} else {
+			/* single rounded border for non-selected cells */
+			draw_rounded_rect_border(dpy, canvas, gc, tx, ty,
+			    tw - 1, th + labelh - 1, cornerradius);
 		}
 
 		/* thumbnail */
@@ -3639,9 +3692,9 @@ drawaltpreview(void)
 		snprintf(label, sizeof(label), "Monitor %d  Tag %d",
 		    ws->mon->num + 1, ws->tagidx + 1);
 		{
-			XftColor *fg = selected ? &clr_selfg : &clr_normfg;
-			int lx = tx + 6;
-			int ly = ty + th + (labelh + fonth) / 2 - 2;
+			fg = selected ? &clr_selfg : &clr_normfg;
+			lx = tx + 6;
+			ly = ty + th + (labelh + fonth) / 2 - 2;
 			XftDrawStringUtf8(xd, fg, drw->fonts->xfont,
 			    lx, ly, (XftChar8 *)label, strlen(label));
 		}
