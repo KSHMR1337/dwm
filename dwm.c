@@ -354,6 +354,7 @@ static void alttabend(int commit);
 static void keyrelease(XEvent *e);
 static void scanworkspaces(void);
 static void captureworkspace(int idx);
+static void regen_all_tagmaps(void);
 static void drawaltpreview(void);
 static void calculategrid(int count, int *rows, int *cols);
 static Monitor *primarymon(void);
@@ -415,8 +416,10 @@ static xcb_connection_t *xcon;
 static Workspace atab_ws[ATAB_MAX_WS];
 static int atab_count   = 0;  /* number of non-empty workspaces found */
 static int atab_sel     = 0;  /* currently highlighted index */
-static int atab_active     = 0;  /* 1 while overlay is shown */
-static int atab_committing = 0;  /* 1 during alttabend commit to suppress switchtag capture */
+static int atab_active       = 0;  /* 1 while overlay is shown */
+static int atab_regen_pending = 0;  /* 1 = regenerate all tagmaps on next event */
+static unsigned int atab_pending_tagmask = 0; /* tagmask to switch to after repaint */
+static Monitor *atab_pending_mon = NULL;      /* monitor for deferred switch */
 static Window atab_win  = 0;  /* the overlay window */
 static int atab_origidx = 0;  /* index of workspace we came from */
 
@@ -1909,9 +1912,41 @@ void run(void) {
   XEvent ev;
   /* main event loop */
   XSync(dpy, False);
-  while (running && !XNextEvent(dpy, &ev))
+  while (running && !XNextEvent(dpy, &ev)) {
     if (handler[ev.type])
       handler[ev.type](&ev); /* call handler */
+    /* After alt-tab closes, regenerate all tagmaps on the next event.
+     * By this point every app has had a full event-loop cycle to repaint,
+     * so Imlib2 captures a clean screen with no overlay ghost. */
+    /* Step 1 (first event after overlay close): do the tag switch.
+     * The overlay is gone and apps have repainted, so switchtag() inside
+     * view() captures the departing tag cleanly. Then set regen_pending
+     * so we capture the newly-arrived tag on the NEXT event iteration,
+     * after its windows have had time to paint. */
+    if (atab_pending_tagmask && !atab_active) {
+      unsigned int mask = atab_pending_tagmask;
+      Monitor *mon      = atab_pending_mon;
+      atab_pending_tagmask = 0;
+      atab_pending_mon     = NULL;
+      if (mon && mon != selmon) {
+        unfocus(selmon->sel, 0);
+        selmon = mon;
+        focus(NULL);
+      }
+      usleep(32000);
+      XSync(dpy, False);
+      view(&(const Arg){.ui = mask});
+      focus(NULL);
+      arrange(selmon);
+      atab_regen_pending = 1; /* capture new tag on next event */
+    }
+    /* Step 2 (second event after overlay close, or after manual switch):
+     * capture the now-visible tag — windows have finished painting. */
+    else if (atab_regen_pending && !atab_active) {
+      atab_regen_pending = 0;
+      regen_all_tagmaps();
+    }
+  }
 }
 
 void scan(void) {
@@ -2558,7 +2593,7 @@ void switchtag(void) {
         XFreePixmap(dpy, selmon->tagmap[i]);
         selmon->tagmap[i] = 0;
       }
-      if (occ & 1 << i && tag_preview && !atab_committing) {
+      if (occ & 1 << i && tag_preview) {
         /* Capture root window using Imlib2 with default visual context */
         imlib_context_set_display(dpy);
         imlib_context_set_visual(dvis);
@@ -2840,6 +2875,7 @@ void view(const Arg *arg) {
 
   focus(NULL);
   arrange(selmon);
+
 }
 
 pid_t winpid(Window w) {
@@ -3505,6 +3541,12 @@ drawaltpreview(void)
 		    DefaultDepth(dpy, screen), InputOutput, DefaultVisual(dpy, screen),
 		    CWOverrideRedirect | CWBackPixel | CWBorderPixel |
 		    CWColormap | CWEventMask, &wa);
+		{
+			Atom wtype = XInternAtom(dpy, "_NET_WM_WINDOW_TYPE", False);
+			Atom wtype_notif = XInternAtom(dpy, "_NET_WM_WINDOW_TYPE_NOTIFICATION", False);
+			XChangeProperty(dpy, atab_win, wtype, XA_ATOM, 32,
+			                PropModeReplace, (unsigned char *)&wtype_notif, 1);
+		}
 	} else {
 		XMoveResizeWindow(dpy, atab_win, win_x, win_y, winw, winh);
 	}
@@ -3647,47 +3689,10 @@ force_populate_tagmaps(void)
 				imlib_render_image_part_on_drawable_at_size(
 				    0, 0, m->mw, m->mh, 0, 0, tw, th);
 				imlib_free_image();
-			} else {
-				/* Tag not visible — temporarily switch to it, capture, restore */
-				unsigned int saved_tagset = m->tagset[m->seltags];
-				Imlib_Image img;
-				int tw = m->mw / scalepreview;
-				int th = m->mh / scalepreview;
-
-				/* Switch tagset and rearrange so windows appear on screen */
-				m->tagset[m->seltags] = mask;
-				arrange(m);
-				/* Two syncs: first flushes commands, second waits for expose events */
-				XSync(dpy, False);
-				XSync(dpy, False);
-
-				XSetErrorHandler(xerrordummy);
-				imlib_context_set_display(dpy);
-				imlib_context_set_visual(dvis);
-				imlib_context_set_colormap(dcmap);
-				imlib_context_set_drawable(droot);
-				imlib_context_set_anti_alias(0);
-				imlib_context_set_dither(0);
-				img = imlib_create_image_from_drawable(0,
-				    m->mx, m->my, m->mw, m->mh, 1);
-				XSetErrorHandler(xerror);
-
-				/* Restore original tagset */
-				m->tagset[m->seltags] = saved_tagset;
-				arrange(m);
-				XSync(dpy, False);
-
-				if (!img) continue;
-				imlib_context_set_image(img);
-				m->tagmap[i] = XCreatePixmap(dpy, droot, tw, th, ddepth);
-				if (!m->tagmap[i]) { imlib_free_image(); continue; }
-				imlib_context_set_visual(dvis);
-				imlib_context_set_colormap(dcmap);
-				imlib_context_set_drawable(m->tagmap[i]);
-				imlib_render_image_part_on_drawable_at_size(
-				    0, 0, m->mw, m->mh, 0, 0, tw, th);
-				imlib_free_image();
 			}
+			/* Non-visible tags with no tagmap are left NULL here.
+			 * They will be captured by captureworkspace() (live) or by
+			 * the post-switch hook in view() after the user visits them. */
 		}
 	}
 }
@@ -3706,7 +3711,7 @@ alttab(const Arg *arg)
 		XSync(dpy, False);
 	}
 
-	/* Ensure every occupied tag has a screenshot before we open the overlay */
+	/* Populate any tags that have no screenshot yet */
 	force_populate_tagmaps();
 
 	atab_origidx = 0;
@@ -3737,7 +3742,7 @@ alttabprev(const Arg *arg)
 		XSync(dpy, False);
 	}
 
-	/* Ensure every occupied tag has a screenshot before we open the overlay */
+	/* Populate any tags that have no screenshot yet */
 	force_populate_tagmaps();
 
 	atab_origidx = 0;
@@ -3754,6 +3759,72 @@ alttabprev(const Arg *arg)
 	XGrabKeyboard(dpy, root, True, GrabModeAsync, GrabModeAsync, CurrentTime);
 }
 
+/*
+ * Refresh only the currently-visible tag on each monitor.
+ * All other tagmaps are left untouched — they were already captured
+ * correctly by switchtag() when the user last switched away from them.
+ * This runs deferred (next event after overlay closes) so the screen
+ * is fully repainted before we grab.
+ */
+static void
+regen_all_tagmaps(void)
+{
+	Monitor *m;
+	Client *c;
+	int i;
+	Visual    *dvis  = DefaultVisual(dpy, screen);
+	Colormap   dcmap = DefaultColormap(dpy, screen);
+	Window     droot = RootWindow(dpy, screen);
+	int        ddepth = DefaultDepth(dpy, screen);
+
+	for (m = mons; m; m = m->next) {
+		/* Only refresh the currently-visible tag — nothing else */
+		for (i = 0; i < (int)LENGTH(tags); i++) {
+			unsigned int mask = 1u << i;
+			if (!(m->tagset[m->seltags] & mask)) continue;
+
+			/* Check occupancy */
+			int has_clients = 0;
+			for (c = m->clients; c; c = c->next)
+				if (c->tags & mask) { has_clients = 1; break; }
+			if (!has_clients) continue;
+
+			/* Free the old capture for this tag only */
+			if (m->tagmap[i]) {
+				XFreePixmap(dpy, m->tagmap[i]);
+				m->tagmap[i] = 0;
+			}
+
+			int tw = m->mw / scalepreview;
+			int th = m->mh / scalepreview;
+			Imlib_Image img;
+
+			XSetErrorHandler(xerrordummy);
+			imlib_context_set_display(dpy);
+			imlib_context_set_visual(dvis);
+			imlib_context_set_colormap(dcmap);
+			imlib_context_set_drawable(droot);
+			imlib_context_set_anti_alias(0);
+			imlib_context_set_dither(0);
+			img = imlib_create_image_from_drawable(0,
+			    m->mx, m->my, m->mw, m->mh, 1);
+			XSetErrorHandler(xerror);
+			if (!img) continue;
+
+			imlib_context_set_image(img);
+			m->tagmap[i] = XCreatePixmap(dpy, droot, tw, th, ddepth);
+			if (!m->tagmap[i]) { imlib_free_image(); continue; }
+			imlib_context_set_visual(dvis);
+			imlib_context_set_colormap(dcmap);
+			imlib_context_set_drawable(m->tagmap[i]);
+			imlib_render_image_part_on_drawable_at_size(
+			    0, 0, m->mw, m->mh, 0, 0, tw, th);
+			imlib_free_image();
+		}
+	}
+}
+
+
 void
 alttabend(int commit)
 {
@@ -3762,39 +3833,53 @@ alttabend(int commit)
 	atab_active = 0;
 	XUngrabKeyboard(dpy, CurrentTime);
 
-	if (atab_win)
-		XUnmapWindow(dpy, atab_win);
-
 	/*
-	 * Flush + sync so X removes the overlay from the screen before
-	 * switchtag() (called inside view()) grabs a screenshot.
-	 * Without this, the alt-tab window itself gets baked into tagmap[].
+	 * Unmap atab_win FIRST so the compositor stops drawing it, then sleep
+	 * to let the compositor repaint without the overlay, then destroy.
+	 * This guarantees atab_win is visually gone before switchtag() or
+	 * regen_all_tagmaps() capture anything — preventing contamination of
+	 * both the source and destination tag previews.
 	 */
-	XSync(dpy, False);
+	if (atab_win) {
+		/* Set opacity to 0 to kill compositor fade animation */
+		{
+			Atom opacity_atom = XInternAtom(dpy, "_NET_WM_WINDOW_OPACITY", False);
+			unsigned long opacity = 0;  /* 0 = fully transparent */
+			XChangeProperty(dpy, atab_win, opacity_atom, XA_CARDINAL, 32,
+			                PropModeReplace, (unsigned char *)&opacity, 1);
+			XSync(dpy, False);
+			usleep(16000);  /* 16ms (~1 frame) — compositor applies opacity */
+			XSync(dpy, False);
+		}
+		XUnmapWindow(dpy, atab_win);
+		XSync(dpy, False);
+		usleep(32000);   /* 32ms (~2 frames) after unmap */
+		XSync(dpy, False);
+		XDestroyWindow(dpy, atab_win);
+		atab_win = 0;
+		XSync(dpy, False);
+		usleep(32000);   /* 32ms (~2 frames) after destroy */
+		XSync(dpy, False);
+	}
 
-	atab_committing = 1;
+	/* Defer the tag switch to the next event loop iteration.
+	 * By then every app has redrawn over the closed overlay, so
+	 * switchtag() will capture a clean screen. */
 	if (commit && atab_count > 0) {
 		ws = &atab_ws[atab_sel];
-		if (ws->mon != selmon) {
-			unfocus(selmon->sel, 0);
-			selmon = ws->mon;
-			focus(NULL);
-		}
-		view(&(const Arg){.ui = ws->tagmask});
+		atab_pending_mon     = ws->mon;
+		atab_pending_tagmask = ws->tagmask;
 	} else if (!commit && atab_count > 0) {
 		ws = &atab_ws[atab_origidx];
-		if (ws->mon != selmon) {
-			unfocus(selmon->sel, 0);
-			selmon = ws->mon;
-			focus(NULL);
+		if (selmon->tagset[selmon->seltags] != ws->tagmask) {
+			atab_pending_mon     = ws->mon;
+			atab_pending_tagmask = ws->tagmask;
 		}
-		if (selmon->tagset[selmon->seltags] != ws->tagmask)
-			view(&(const Arg){.ui = ws->tagmask});
 	}
-	atab_committing = 0;
-
-	focus(NULL);
-	arrange(selmon);
+	/* Only set regen now if there's no pending switch.
+	 * If there is a pending switch, run() will set regen after view() fires. */
+	if (!atab_pending_tagmask)
+		atab_regen_pending = 1;
 }
 
 void
