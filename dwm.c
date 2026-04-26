@@ -250,6 +250,7 @@ static Monitor *numtomon(int num);
 static void drawbar(Monitor *m);
 static void drawbars(void);
 static void enternotify(XEvent *e);
+static void leavenotify(XEvent *e);
 static void expose(XEvent *e);
 static void focus(Client *c);
 static void focusin(XEvent *e);
@@ -358,6 +359,10 @@ static void regen_all_tagmaps(void);
 static void drawaltpreview(void);
 static void calculategrid(int count, int *rows, int *cols);
 static Monitor *primarymon(void);
+static int atab_hit_test(int x, int y);
+static void atab_grid_move(int drow, int dcol);
+static int atab_wait_for_release(int ms);
+static void atab_quick_switch(int target);
 
 static pid_t getparentprocess(pid_t p);
 static int isdescprocess(pid_t p, pid_t c);
@@ -386,6 +391,7 @@ static void (*handler[LASTEvent])(XEvent *) = {
     [ConfigureNotify] = configurenotify,
     [DestroyNotify] = destroynotify,
     [EnterNotify] = enternotify,
+    [LeaveNotify] = leavenotify,
     [Expose] = expose,
     [FocusIn] = focusin,
     [KeyPress] = keypress,
@@ -422,6 +428,13 @@ static unsigned int atab_pending_tagmask = 0; /* tagmask to switch to after repa
 static Monitor *atab_pending_mon = NULL;      /* monitor for deferred switch */
 static Window atab_win  = 0;  /* the overlay window */
 static int atab_origidx = 0;  /* index of workspace we came from */
+/* Per-cell hit rects (in atab_win local coordinates) for mouse hit testing. */
+static int atab_cell_x[ATAB_MAX_WS];
+static int atab_cell_y[ATAB_MAX_WS];
+static int atab_cell_w[ATAB_MAX_WS];
+static int atab_cell_h[ATAB_MAX_WS];
+static int atab_rows = 0;
+static int atab_cols = 0;
 
 /* configuration, allows nested code to access above variables */
 #include "config.h"
@@ -434,6 +447,8 @@ struct Pertag {
   const Layout
       *ltidxs[LENGTH(tags) + 1][2]; /* matrix of tags and layouts indexes  */
   int showbars[LENGTH(tags) + 1];   /* display bar for the current tag */
+  int tag_history[LENGTH(tags)];    /* MRU stack: [0]=most recently left */
+  int tag_history_len;              /* valid entries in tag_history */
 };
 
 static unsigned int scratchtag = 1 << LENGTH(tags);
@@ -632,6 +647,26 @@ void buttonpress(XEvent *e) {
   Monitor *m;
   XButtonPressedEvent *ev = &e->xbutton;
   char *text, *s, ch;
+
+  /* Alt-tab overlay: click commits to the hovered cell; right-click cancels. */
+  if (atab_active && atab_win && ev->window == atab_win) {
+    if (ev->button == Button3) {
+      alttabend(0);
+      return;
+    }
+    if (ev->button == Button1) {
+      int hit = atab_hit_test(ev->x, ev->y);
+      if (hit >= 0) atab_sel = hit;
+      alttabend(1);
+      return;
+    }
+    return;
+  }
+  /* Click outside the overlay cancels. */
+  if (atab_active && atab_win && ev->window != atab_win) {
+    alttabend(0);
+    return;
+  }
 
   click = ClkRootWin;
   /* focus monitor if necessary */
@@ -1108,6 +1143,23 @@ void enternotify(XEvent *e) {
   focus(c);
 }
 
+void leavenotify(XEvent *e) {
+  Monitor *m;
+  XCrossingEvent *ev = &e->xcrossing;
+
+  /* Ignore grab/ungrab-induced LeaveNotify and inferior crossings. */
+  if (ev->mode != NotifyNormal || ev->detail == NotifyInferior)
+    return;
+
+  /* Hide tag preview whenever the pointer leaves a bar. */
+  for (m = mons; m; m = m->next) {
+    if (ev->window == m->barwin && m->previewshow) {
+      m->previewshow = 0;
+      XUnmapWindow(dpy, m->tagwin);
+    }
+  }
+}
+
 void expose(XEvent *e) {
   Monitor *m;
   XExposeEvent *ev = &e->xexpose;
@@ -1410,6 +1462,10 @@ void keypress(XEvent *e) {
       alttabend(0);  /* cancel, return to original */
       return;
     }
+    if (keysym == XK_Return || keysym == XK_KP_Enter || keysym == XK_space) {
+      alttabend(1);  /* commit current selection */
+      return;
+    }
     if (keysym == XK_Tab) {
       if (ev->state & ShiftMask) {
         atab_sel = (atab_sel - 1 + atab_count) % atab_count;
@@ -1426,6 +1482,27 @@ void keypress(XEvent *e) {
     }
     if (keysym == ALTTAB_KEY) {
       atab_sel = (atab_sel + 1) % atab_count;
+      drawaltpreview();
+      return;
+    }
+    /* hjkl / arrow-key 2D grid navigation while Alt is held */
+    if (keysym == XK_h || keysym == XK_Left) {
+      atab_grid_move(0, -1);
+      drawaltpreview();
+      return;
+    }
+    if (keysym == XK_l || keysym == XK_Right) {
+      atab_grid_move(0, +1);
+      drawaltpreview();
+      return;
+    }
+    if (keysym == XK_k || keysym == XK_Up) {
+      atab_grid_move(-1, 0);
+      drawaltpreview();
+      return;
+    }
+    if (keysym == XK_j || keysym == XK_Down) {
+      atab_grid_move(+1, 0);
       drawaltpreview();
       return;
     }
@@ -1598,22 +1675,46 @@ void motionnotify(XEvent *e) {
   Monitor *m;
   XMotionEvent *ev = &e->xmotion;
 
+  /* Alt-tab overlay: track the cell under the cursor and highlight it. */
+  if (atab_active && atab_win && ev->window == atab_win) {
+    int hit = atab_hit_test(ev->x, ev->y);
+    if (hit >= 0 && hit != atab_sel) {
+      atab_sel = hit;
+      drawaltpreview();
+    }
+    return;
+  }
+
   if (ev->window == selmon->barwin) {
     unsigned int occ = 0;
+    unsigned int hovered;
+    unsigned int next_x;
     Client *c;
     for (c = selmon->clients; c; c = c->next)
       occ |= c->tags;
 
+    /* Ignore motion events with coordinates outside the bar — they can
+     * arrive on re-grabs or when the pointer has already crossed out. */
+    if (ev->x < 0 || ev->x >= selmon->ww - 2 * sp ||
+        ev->y < 0 || ev->y >= bh) {
+      if (selmon->previewshow) {
+        selmon->previewshow = 0;
+        showtagpreview(0);
+      }
+      if (ev->window != root)
+        return;
+    }
+
     /* Walk visible tags to find which one the pointer is over */
     i = 0; x = 0;
-    unsigned int hovered = LENGTH(tags); /* sentinel: not hovering any tag */
+    hovered = LENGTH(tags); /* sentinel: not hovering any tag */
     while (i < LENGTH(tags)) {
       /* skip vacant tags (same rule as drawbar/buttonpress) */
       if (!(occ & 1 << i || selmon->tagset[selmon->seltags] & 1 << i)) {
         i++;
         continue;
       }
-      unsigned int next_x = x + TEXTW(tags[i]);
+      next_x = x + TEXTW(tags[i]);
       if ((int)ev->x >= (int)x && (int)ev->x < (int)next_x) {
         hovered = i;
         break;
@@ -2511,12 +2612,12 @@ void updatebars(void) {
                              .background_pixel = 0,
                              .border_pixel = 0,
                              .colormap = cmap,
-                             .event_mask = ButtonPressMask | ExposureMask | PointerMotionMask};
+                             .event_mask = ButtonPressMask | ExposureMask | PointerMotionMask | LeaveWindowMask};
   XClassHint ch = {"dwm", "dwm"};
   for (m = mons; m; m = m->next) {
     if (m->barwin) {
       /* bar already exists — update its event mask to include motion */
-      XSetWindowAttributes update_wa = {.event_mask = ButtonPressMask | ExposureMask | PointerMotionMask};
+      XSetWindowAttributes update_wa = {.event_mask = ButtonPressMask | ExposureMask | PointerMotionMask | LeaveWindowMask};
       XChangeWindowAttributes(dpy, m->barwin, CWEventMask, &update_wa);
       continue;
     }
@@ -2835,12 +2936,37 @@ void updatewmhints(Client *c) {
 }
 
 void view(const Arg *arg) {
-  int i;
+  int i, j, oldidx;
   unsigned int tmptag;
 
   if ((arg->ui & TAGMASK) == selmon->tagset[selmon->seltags])
     return;
   switchtag();
+
+  /* Push the tag we're leaving onto the MRU history stack. */
+  oldidx = (int)selmon->pertag->curtag - 1;
+  if (oldidx >= 0) {
+    /* Remove any existing occurrence of oldidx to avoid duplicates. */
+    for (i = 0; i < selmon->pertag->tag_history_len; i++) {
+      if (selmon->pertag->tag_history[i] == oldidx) {
+        for (j = i; j < selmon->pertag->tag_history_len - 1; j++)
+          selmon->pertag->tag_history[j] = selmon->pertag->tag_history[j + 1];
+        selmon->pertag->tag_history_len--;
+        break;
+      }
+    }
+    /* Shift right and prepend. */
+    if (selmon->pertag->tag_history_len < (int)LENGTH(tags)) {
+      for (i = selmon->pertag->tag_history_len; i > 0; i--)
+        selmon->pertag->tag_history[i] = selmon->pertag->tag_history[i - 1];
+      selmon->pertag->tag_history_len++;
+    } else {
+      for (i = (int)LENGTH(tags) - 1; i > 0; i--)
+        selmon->pertag->tag_history[i] = selmon->pertag->tag_history[i - 1];
+    }
+    selmon->pertag->tag_history[0] = oldidx;
+  }
+
   selmon->seltags ^= 1; /* toggle sel tagset */
   if (arg->ui & TAGMASK) {
     selmon->tagset[selmon->seltags] = arg->ui & TAGMASK;
@@ -3265,47 +3391,122 @@ calculategrid(int count, int *rows, int *cols)
 	*cols = (count + *rows - 1) / *rows;
 }
 
+/*
+ * Count clients on monitor m with tag bitmask mask.
+ */
+static int
+countclients(Monitor *m, unsigned int mask)
+{
+	Client *c;
+	int cnt = 0;
+	for (c = m->clients; c; c = c->next)
+		if (c->tags & mask) cnt++;
+	return cnt;
+}
+
+/*
+ * Add workspace (m, tagidx) to atab_ws if not already present and has clients.
+ * added[tagidx] tracks whether this tag on m was already inserted (only valid
+ * for selmon; other monitors use a separate call site that avoids duplicates).
+ * Returns 1 if added, 0 otherwise.
+ */
+static int
+try_add_ws(Monitor *m, int tagidx, int *n, unsigned int curtag)
+{
+	unsigned int mask = 1u << tagidx;
+	int cnt;
+
+	if (mask == curtag && m == selmon) return 0;
+	cnt = countclients(m, mask);
+	if (cnt == 0) return 0;
+	if (*n >= ATAB_MAX_WS) return 0;
+	atab_ws[(*n)++] = (Workspace){m, mask, tagidx, cnt, 0, 0, 0};
+	return 1;
+}
+
 void
 scanworkspaces(void)
 {
 	Monitor *m;
-	Client *c;
 	int i, n = 0;
-	int pass;
-	unsigned int curtag, mask;
+	unsigned int curtag, seltag;
 	int cnt, tidx;
+	int added[LENGTH(tags)]; /* tracks which selmon tag indices were added */
+	int h;
 
 	atab_count = 0;
+	for (i = 0; i < (int)LENGTH(tags); i++) added[i] = 0;
 
-	/* slot 0: selmon's current tag */
+	/* Slot 0: selmon's current (visible) tag. */
+	curtag = selmon->tagset[selmon->seltags];
+	cnt = 0;
+	tidx = 0;
 	{
-		curtag = selmon->tagset[selmon->seltags];
-		cnt = 0;
-		tidx = 0;
+		Client *c;
 		for (c = selmon->clients; c; c = c->next)
 			if (c->tags & curtag) cnt++;
-		for (i = 0; i < (int)LENGTH(tags); i++)
-			if ((1u << i) == curtag) { tidx = i; break; }
-		if (cnt > 0 && n < ATAB_MAX_WS)
-			atab_ws[n++] = (Workspace){selmon, curtag, tidx, cnt, 0, 0, 0};
+	}
+	for (i = 0; i < (int)LENGTH(tags); i++)
+		if ((1u << i) == curtag) { tidx = i; break; }
+	if (cnt > 0 && n < ATAB_MAX_WS) {
+		atab_ws[n++] = (Workspace){selmon, curtag, tidx, cnt, 0, 0, 0};
+		added[tidx] = 1;
 	}
 
-	for (pass = 0; pass < 2 && n < ATAB_MAX_WS; pass++) {
-		for (m = mons; m && n < ATAB_MAX_WS; m = m->next) {
-			if (pass == 0 && m != selmon) continue;
-			if (pass == 1 && m == selmon) continue;
-			curtag = m->tagset[m->seltags];
-			for (i = 0; i < (int)LENGTH(tags) && n < ATAB_MAX_WS; i++) {
-				mask = 1u << i;
-				if (m == selmon && mask == curtag) continue;
-				cnt = 0;
-				for (c = m->clients; c; c = c->next)
-					if (c->tags & mask) cnt++;
-				if (cnt == 0) continue;
-				atab_ws[n++] = (Workspace){m, mask, i, cnt, 0, 0, 0};
+	/*
+	 * Remaining selmon tags in MRU order (most-recently-left first),
+	 * then any remaining selmon tags not yet in history.
+	 */
+	for (h = 0; h < selmon->pertag->tag_history_len && n < ATAB_MAX_WS; h++) {
+		i = selmon->pertag->tag_history[h];
+		if (i < 0 || i >= (int)LENGTH(tags)) continue;
+		if (added[i]) continue;
+		if (try_add_ws(selmon, i, &n, curtag))
+			added[i] = 1;
+		else
+			added[i] = 1; /* mark even if empty to skip below */
+	}
+	/* Any selmon tags not yet seen (never visited or no clients). */
+	for (i = 0; i < (int)LENGTH(tags) && n < ATAB_MAX_WS; i++) {
+		if (added[i]) continue;
+		seltag = 1u << i;
+		if (seltag == curtag) continue;
+		try_add_ws(selmon, i, &n, curtag);
+		added[i] = 1;
+	}
+
+	/* Other monitors: MRU order within each monitor, monitors in list order. */
+	for (m = mons; m && n < ATAB_MAX_WS; m = m->next) {
+		int madded[LENGTH(tags)];
+		if (m == selmon) continue;
+		for (i = 0; i < (int)LENGTH(tags); i++) madded[i] = 0;
+		curtag = m->tagset[m->seltags];
+		/* Current tag on this monitor first. */
+		for (i = 0; i < (int)LENGTH(tags) && n < ATAB_MAX_WS; i++) {
+			if ((1u << i) == curtag) {
+				if (!madded[i]) {
+					try_add_ws(m, i, &n, 0);
+					madded[i] = 1;
+				}
+				break;
 			}
 		}
+		/* MRU history for this monitor. */
+		for (h = 0; h < m->pertag->tag_history_len && n < ATAB_MAX_WS; h++) {
+			i = m->pertag->tag_history[h];
+			if (i < 0 || i >= (int)LENGTH(tags)) continue;
+			if (madded[i]) continue;
+			try_add_ws(m, i, &n, 0);
+			madded[i] = 1;
+		}
+		/* Remaining tags on this monitor. */
+		for (i = 0; i < (int)LENGTH(tags) && n < ATAB_MAX_WS; i++) {
+			if (madded[i]) continue;
+			try_add_ws(m, i, &n, 0);
+			madded[i] = 1;
+		}
 	}
+
 	atab_count = n;
 }
 
@@ -3398,6 +3599,70 @@ atab_alloc_color(XftColor *clr, const char *hex)
 {
 	XftColorAllocName(dpy, DefaultVisual(dpy, screen),
 	    DefaultColormap(dpy, screen), hex, clr);
+}
+
+/*
+ * Return the cell index whose rect contains (x, y) in atab_win coordinates,
+ * or -1 if no cell is under that point.  Rects are populated by
+ * drawaltpreview() on its most recent call.
+ */
+static int
+atab_hit_test(int x, int y)
+{
+	int i;
+
+	for (i = 0; i < atab_count; i++) {
+		if (x >= atab_cell_x[i] &&
+		    x <  atab_cell_x[i] + atab_cell_w[i] &&
+		    y >= atab_cell_y[i] &&
+		    y <  atab_cell_y[i] + atab_cell_h[i])
+			return i;
+	}
+	return -1;
+}
+
+/*
+ * Move the alt-tab selection in the grid by (drow, dcol).  Wraps at edges.
+ * Horizontal moves (h/l) flow onto adjacent rows when they cross the
+ * row boundary, so the selection reads left-to-right, top-to-bottom
+ * like text.  Vertical moves (j/k) wrap within the same column, and
+ * clamp to the last valid cell when landing in an empty tail slot of
+ * the final partial row.
+ */
+static void
+atab_grid_move(int drow, int dcol)
+{
+	int row, col, nrow, ncol, idx;
+
+	if (atab_cols <= 0 || atab_rows <= 0 || atab_count <= 0) return;
+
+	row = atab_sel / atab_cols;
+	col = atab_sel % atab_cols;
+
+	if (dcol != 0) {
+		/* Horizontal move: treat the grid as a flat list so h/l at
+		 * a row edge rolls onto the previous/next row. */
+		idx = (atab_sel + dcol + atab_count) % atab_count;
+		atab_sel = idx;
+		return;
+	}
+
+	nrow = row + drow;
+	ncol = col;
+
+	/* wrap rows */
+	if (nrow < 0) nrow = atab_rows - 1;
+	else if (nrow >= atab_rows) nrow = 0;
+
+	idx = nrow * atab_cols + ncol;
+	if (idx >= atab_count) {
+		/* Landed in an empty tail slot of the last partial row:
+		 * skip up to the last full row that has this column. */
+		nrow = (atab_count - 1) / atab_cols;
+		idx = nrow * atab_cols + ncol;
+		if (idx >= atab_count) idx = atab_count - 1;
+	}
+	atab_sel = idx;
 }
 
 /*
@@ -3544,6 +3809,8 @@ drawaltpreview(void)
 	if (!pm) return;
 
 	calculategrid(atab_count, &rows, &cols);
+	atab_rows = rows;
+	atab_cols = cols;
 
 	fonth  = drw->fonts->h;
 	pad    = 14;
@@ -3599,7 +3866,9 @@ drawaltpreview(void)
 		wa.override_redirect = True;
 		wa.background_pixmap = ParentRelative;  /* prevent color flash */
 		wa.colormap          = DefaultColormap(dpy, screen);
-		wa.event_mask        = ExposureMask | KeyPressMask;
+		wa.event_mask        = ExposureMask | KeyPressMask |
+		                       ButtonPressMask | ButtonReleaseMask |
+		                       PointerMotionMask;
 		atab_win = XCreateWindow(dpy, root,
 		    win_x, win_y,
 		    winw, winh, 0,
@@ -3658,9 +3927,16 @@ drawaltpreview(void)
 		tw  = cellw - pad / 2;
 		th  = cellh - labelh - pad / 2;
 
-		/* rounded border for preview box (double border for selection) */
-		XSetForeground(dpy, gc, px_selborder);
+		/* Remember cell rect for mouse hit testing. Span the full cell
+		 * including its label area for a comfortable click target. */
+		atab_cell_x[i] = tx;
+		atab_cell_y[i] = ty;
+		atab_cell_w[i] = tw;
+		atab_cell_h[i] = th + labelh;
+
+		/* rounded border only for selected cell */
 		if (selected) {
+			XSetForeground(dpy, gc, px_selborder);
 			/* double rounded border for selected cell */
 			draw_rounded_rect_border(dpy, canvas, gc, tx, ty,
 			    tw - 1, th + labelh - 1, cornerradius);
@@ -3668,10 +3944,6 @@ drawaltpreview(void)
 			    tx + borderpx, ty + borderpx,
 			    tw - 1 - borderpx * 2, th + labelh - 1 - borderpx * 2,
 			    cornerradius > borderpx ? cornerradius - borderpx : 1);
-		} else {
-			/* single rounded border for non-selected cells */
-			draw_rounded_rect_border(dpy, canvas, gc, tx, ty,
-			    tw - 1, th + labelh - 1, cornerradius);
 		}
 
 		/* thumbnail */
@@ -3789,13 +4061,73 @@ force_populate_tagmaps(void)
 	}
 }
 
+/*
+ * Poll the keyboard for up to `ms` milliseconds.  Returns 1 as soon as
+ * the Alt modifier is no longer held, 0 if the timeout elapses with Alt
+ * still held.  Used to implement the hold-to-show-overlay behavior: a
+ * quick Alt+Tab tap should just switch workspaces without flashing the
+ * overlay on screen.
+ */
+static int
+atab_wait_for_release(int ms)
+{
+	char keys[32];
+	KeyCode kc_l, kc_r;
+	int elapsed;
+	int held;
+
+	kc_l = XKeysymToKeycode(dpy, XK_Alt_L);
+	kc_r = XKeysymToKeycode(dpy, XK_Alt_R);
+
+	for (elapsed = 0; elapsed < ms; elapsed += 10) {
+		XQueryKeymap(dpy, keys);
+		held = 0;
+		if (kc_l && (keys[kc_l / 8] & (1 << (kc_l % 8)))) held = 1;
+		if (kc_r && (keys[kc_r / 8] & (1 << (kc_r % 8)))) held = 1;
+		if (!held) return 1;
+		usleep(10000);
+	}
+	return 0;
+}
+
+/*
+ * Commit a workspace switch to atab_ws[target] without showing the
+ * overlay.  Uses the same deferred pending-switch mechanism as
+ * alttabend(), so the tagmap capture/restore flow stays consistent.
+ */
+static void
+atab_quick_switch(int target)
+{
+	Workspace *ws;
+
+	if (target < 0 || target >= atab_count) return;
+	ws = &atab_ws[target];
+	if (ws->mon && ws->tagmask &&
+	    !(ws->mon == selmon &&
+	      selmon->tagset[selmon->seltags] == ws->tagmask)) {
+		atab_pending_mon     = ws->mon;
+		atab_pending_tagmask = ws->tagmask;
+	}
+	atab_regen_pending = 1;
+}
+
 void
 alttab(const Arg *arg)
 {
 	int i;
+	int target;
 
 	scanworkspaces();
 	if (atab_count < 2) return;
+
+	target = 1 % atab_count;
+
+	/* If Alt is released within ALTTAB_RELEASE_MS, just switch to the
+	 * next workspace without flashing the overlay. */
+	if (atab_wait_for_release(ALTTAB_RELEASE_MS)) {
+		atab_quick_switch(target);
+		return;
+	}
 
 	/* Hide any existing overlay so it doesn't appear in screenshots */
 	if (atab_win) {
@@ -3810,7 +4142,7 @@ alttab(const Arg *arg)
 	for (i = 0; i < atab_count; i++)
 		captureworkspace(i);
 
-	atab_sel    = 1 % atab_count;
+	atab_sel    = target;
 	atab_active = 1;
 
 	drawaltpreview();
@@ -3818,15 +4150,30 @@ alttab(const Arg *arg)
 	XFlush(dpy);
 	XSetInputFocus(dpy, atab_win, RevertToPointerRoot, CurrentTime);
 	XGrabKeyboard(dpy, root, True, GrabModeAsync, GrabModeAsync, CurrentTime);
+	/* owner_events=True so ButtonPress/Motion on atab_win deliver via the
+	 * window's event mask; outside the window they are reported to root.
+	 * confine_to=None lets the pointer move freely across the desktop so
+	 * the user can click any other window to dismiss the overlay. */
+	XGrabPointer(dpy, root, True,
+	    ButtonPressMask | ButtonReleaseMask | PointerMotionMask,
+	    GrabModeAsync, GrabModeAsync, None, None, CurrentTime);
 }
 
 void
 alttabprev(const Arg *arg)
 {
 	int i;
+	int target;
 
 	scanworkspaces();
 	if (atab_count < 2) return;
+
+	target = atab_count - 1;
+
+	if (atab_wait_for_release(ALTTAB_RELEASE_MS)) {
+		atab_quick_switch(target);
+		return;
+	}
 
 	/* Hide any existing overlay so it doesn't appear in screenshots */
 	if (atab_win) {
@@ -3841,7 +4188,7 @@ alttabprev(const Arg *arg)
 	for (i = 0; i < atab_count; i++)
 		captureworkspace(i);
 
-	atab_sel    = atab_count - 1;
+	atab_sel    = target;
 	atab_active = 1;
 
 	drawaltpreview();
@@ -3849,6 +4196,9 @@ alttabprev(const Arg *arg)
 	XFlush(dpy);
 	XSetInputFocus(dpy, atab_win, RevertToPointerRoot, CurrentTime);
 	XGrabKeyboard(dpy, root, True, GrabModeAsync, GrabModeAsync, CurrentTime);
+	XGrabPointer(dpy, root, True,
+	    ButtonPressMask | ButtonReleaseMask | PointerMotionMask,
+	    GrabModeAsync, GrabModeAsync, None, None, CurrentTime);
 }
 
 /*
@@ -3924,6 +4274,7 @@ alttabend(int commit)
 
 	atab_active = 0;
 	XUngrabKeyboard(dpy, CurrentTime);
+	XUngrabPointer(dpy, CurrentTime);
 
 	/*
 	 * Unmap atab_win FIRST so the compositor stops drawing it, then sleep
@@ -3978,11 +4329,31 @@ void
 keyrelease(XEvent *e)
 {
 	XKeyEvent *ev = &e->xkey;
-	KeySym keysym = XKeycodeToKeysym(dpy, (KeyCode)ev->keycode, 0);
+	KeySym keysym = XLookupKeysym(ev, 0);
 
-	if (atab_active &&
-	    (keysym == XK_Alt_L || keysym == XK_Alt_R ||
-	     keysym == XK_Super_L || keysym == XK_Super_R)) {
+	if (!atab_active) return;
+
+	/* Ignore X11 auto-repeat: when a key is being held, X delivers a
+	 * KeyRelease immediately followed by an identical KeyPress with the
+	 * same timestamp.  Peek for that pattern and skip both so a held
+	 * Alt-Tab doesn't commit while the user is still spinning through. */
+	if (XEventsQueued(dpy, QueuedAfterReading)) {
+		XEvent nev;
+		XPeekEvent(dpy, &nev);
+		if (nev.type == KeyPress &&
+		    nev.xkey.time == ev->time &&
+		    nev.xkey.keycode == ev->keycode) {
+			/* consume the paired KeyPress so alttab()/keypress()
+			 * don't re-trigger from auto-repeat */
+			XNextEvent(dpy, &nev);
+			return;
+		}
+	}
+
+	/* Only commit when the modifier (Alt/Super) is actually released.
+	 * Other key releases while the overlay is open are ignored. */
+	if (keysym == XK_Alt_L || keysym == XK_Alt_R ||
+	    keysym == XK_Super_L || keysym == XK_Super_R) {
 		alttabend(1);
 	}
 }
