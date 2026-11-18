@@ -87,7 +87,9 @@ static const Rule rules[] = {
     {"Gimp", NULL, NULL, 0, 1, 0, 0, -1},
     {"Firefox", NULL, NULL, 1 << 8, 0, 0, -1, -1},
     {"St", NULL, NULL, 0, 0, 1, 0, -1},
+    {"tabbed", NULL, NULL, 0, 0, 1, 0, -1},
     {NULL, NULL, "Event Tester", 0, 0, 0, 1, -1}, /* xev */
+    {"dragon-drop", NULL, NULL, 0, 1, 0, 0, -1},
 };
 
 /* layout(s) */
@@ -224,12 +226,13 @@ static const Key keys[] = {
      spawn,
      {.v = (const char *[]){"dmenu_sys", NULL}}},
     {ALTMOD, XK_Escape, spawn, SHCMD("~/.local/bin/change_keyboard_layout.sh")},
-    {MODKEY, XK_s, spawn, SHCMD("~/.local/bin/change_theme.sh")},
     {MODKEY | ALTMOD | ShiftMask, XK_s, spawn, SHCMD("pavucontrol")},
     {MODKEY | ALTMOD | ShiftMask, XK_b, spawn, SHCMD("blueman-manager")},
     {MODKEY | ALTMOD | ShiftMask, XK_d, spawn, SHCMD("discord")},
     {MODKEY | ALTMOD | ShiftMask, XK_o, spawn, SHCMD("obsidian")},
     {MODKEY | ALTMOD | ShiftMask, XK_v, spawn, SHCMD("stremio")},
+    {MODKEY | ALTMOD | ShiftMask, XK_z, spawn,
+     SHCMD("~/.local/bin/get_vpn_ip.sh")},
 };
 
 /* button definitions */
