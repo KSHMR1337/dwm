@@ -35,8 +35,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/select.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 #ifdef XINERAMA
 #include <X11/extensions/Xinerama.h>
@@ -153,11 +155,19 @@ struct Client {
   int bw, oldbw;
   unsigned int tags;
   int isfixed, isfloating, isurgent, neverfocus, oldstate, isfullscreen,
-      isterminal, noswallow;
+      isterminal, noswallow, isglued, glue_rescaled;
+  /* Qt rescale nudge: for isglued clients, Qt ignores the tile-size
+     configure sent during manage() because it's still initializing.
+     We re-issue a perturbed resize every second until Qt's user_size
+     changes from its initial value, giving up after 20 tries. */
+  int rescale_tries_left;
+  int rescale_initial_w, rescale_initial_h;
+  struct timespec rescale_next;
   pid_t pid;
   Client *next;
   Client *snext;
   Client *swallowing;
+  Client *glue_parent;
   Monitor *mon;
   Window win;
 };
@@ -223,6 +233,7 @@ typedef struct {
   int isterminal;
   int noswallow;
   int monitor;
+  int isglued;
 } Rule;
 
 /* function declarations */
@@ -290,9 +301,13 @@ static void resizeclient(Client *c, int x, int y, int w, int h);
 static void resizemouse(const Arg *arg);
 static void restack(Monitor *m);
 static void run(void);
+static void rescale_schedule(Client *c);
+static void rescale_tick(void);
 static void scan(void);
 static int sendevent(Client *c, Atom proto);
 static void sendmon(Client *c, Monitor *m);
+static void snapglue(Client *parent);
+static int bindglueparent(Client *c);
 static void setclientstate(Client *c, long state);
 static void setfocus(Client *c);
 static void setfullscreen(Client *c, int fullscreen);
@@ -481,6 +496,7 @@ void applyrules(Client *c) {
       c->isterminal = r->isterminal;
       c->noswallow = r->noswallow;
       c->isfloating = r->isfloating;
+      c->isglued = r->isglued;
       c->tags |= r->tags;
       for (m = mons; m && m->num != r->monitor; m = m->next)
         ;
@@ -563,6 +579,9 @@ int applysizehints(Client *c, int *x, int *y, int *w, int *h, int interact) {
 }
 
 void arrange(Monitor *m) {
+  Monitor *mn;
+  Client *p;
+
   if (m)
     showhide(m->stack);
   else
@@ -570,10 +589,18 @@ void arrange(Monitor *m) {
       showhide(m->stack);
   if (m) {
     arrangemon(m);
+    for (p = m->clients; p; p = p->next)
+      if (p->isglued && !p->isfloating && ISVISIBLE(p))
+        snapglue(p);
     restack(m);
-  } else
-    for (m = mons; m; m = m->next)
-      arrangemon(m);
+  } else {
+    for (mn = mons; mn; mn = mn->next) {
+      arrangemon(mn);
+      for (p = mn->clients; p; p = p->next)
+        if (p->isglued && !p->isfloating && ISVISIBLE(p))
+          snapglue(p);
+    }
+  }
 }
 
 void arrangemon(Monitor *m) {
@@ -890,6 +917,11 @@ void configurerequest(XEvent *e) {
   XWindowChanges wc;
 
   if ((c = wintoclient(ev->window))) {
+    /* Glued transients: the WM owns their position (snapglue places them
+       against the parent's content edge). Ignore client-requested X/Y —
+       Qt sometimes sends spurious offscreen coords (e.g. Y=-922). */
+    if (c->glue_parent)
+      ev->value_mask &= ~(CWX | CWY);
     if (ev->value_mask & CWBorderWidth)
       c->bw = ev->border_width;
     else if (c->isfloating || !selmon->lt[selmon->sellt]->arrange) {
@@ -1635,6 +1667,36 @@ void manage(Window w, XWindowAttributes *wa) {
     XMapWindow(dpy, c->win);
   if (term)
     swallow(term, c);
+  /* Glue plumbing: if this is a transient of a managed glued parent,
+     bind it. If this is itself a glued tiled parent, sweep any orphan
+     transients (sidebar maps before parent — e.g. Android Emulator). */
+  if (bindglueparent(c)) {
+    arrange(c->mon);
+  } else if (c->isglued) {
+    Monitor *mn;
+    Client *oc;
+    Window orphan_trans;
+    int adopted = 0;
+    for (mn = mons; mn; mn = mn->next) {
+      for (oc = mn->clients; oc; oc = oc->next) {
+        if (oc == c || oc->glue_parent)
+          continue;
+        if (!XGetTransientForHint(dpy, oc->win, &orphan_trans))
+          continue;
+        if (orphan_trans == c->win ||
+            (c->swallowing && orphan_trans == c->swallowing->win)) {
+          oc->glue_parent = c;
+          adopted = 1;
+        }
+      }
+    }
+    if (adopted)
+      arrange(c->mon);
+    /* Qt silently ignores the tile-size configure sent above because it's
+       still initializing. rescale_tick() will re-issue a perturbed resize
+       once per second until Qt rescales (user_size changes) or we give up. */
+    rescale_schedule(c);
+  }
   focus(NULL);
 }
 
@@ -1923,6 +1985,74 @@ void resizeclient(Client *c, int x, int y, int w, int h) {
   XSync(dpy, False);
 }
 
+void
+rescale_schedule(Client *c)
+{
+  XSizeHints h;
+  long sup;
+
+  c->rescale_tries_left = 20;
+  c->rescale_initial_w = c->rescale_initial_h = 0;
+  if (XGetWMNormalHints(dpy, c->win, &h, &sup) && (h.flags & USSize)) {
+    c->rescale_initial_w = h.width;
+    c->rescale_initial_h = h.height;
+  }
+  clock_gettime(CLOCK_MONOTONIC, &c->rescale_next);
+  c->rescale_next.tv_sec += 1;
+}
+
+static int
+timespec_cmp(const struct timespec *a, const struct timespec *b)
+{
+  if (a->tv_sec != b->tv_sec)
+    return a->tv_sec < b->tv_sec ? -1 : 1;
+  if (a->tv_nsec != b->tv_nsec)
+    return a->tv_nsec < b->tv_nsec ? -1 : 1;
+  return 0;
+}
+
+void
+rescale_tick(void)
+{
+  struct timespec now;
+  Monitor *m;
+  Client *c;
+  XSizeHints h;
+  long sup;
+  int ow;
+
+  clock_gettime(CLOCK_MONOTONIC, &now);
+  for (m = mons; m; m = m->next) {
+    for (c = m->clients; c; c = c->next) {
+      if (c->rescale_tries_left <= 0)
+        continue;
+      if (timespec_cmp(&now, &c->rescale_next) < 0)
+        continue;
+      /* Did Qt rescale on its own since the last tick? */
+      if (XGetWMNormalHints(dpy, c->win, &h, &sup) && (h.flags & USSize) &&
+          (h.width != c->rescale_initial_w ||
+           h.height != c->rescale_initial_h)) {
+        c->rescale_tries_left = 0;
+        /* Reposition glued transients against the new content edge. */
+        if (c->isglued)
+          snapglue(c);
+        continue;
+      }
+      /* Nudge Qt: perturb size by 1px then restore. Qt filters same-size
+         configures, so a real delta is needed to wake it up. */
+      if (ISVISIBLE(c) && !c->isfloating &&
+          c->mon->lt[c->mon->sellt]->arrange) {
+        ow = c->w;
+        resizeclient(c, c->x, c->y, ow - 1, c->h);
+        resizeclient(c, c->x, c->y, ow, c->h);
+      }
+      c->rescale_tries_left--;
+      c->rescale_next = now;
+      c->rescale_next.tv_sec += 1;
+    }
+  }
+}
+
 void resizemouse(const Arg *arg) {
   int ocx, ocy, nw, nh;
   Client *c;
@@ -2008,11 +2138,59 @@ void restack(Monitor *m) {
 
 void run(void) {
   XEvent ev;
+  int xfd, pending, has_deadline;
+  fd_set rfds;
+  struct timespec now, next;
+  struct timeval tv, *tvp;
+  Monitor *m;
+  Client *c;
+  long sec, nsec;
+
   /* main event loop */
   XSync(dpy, False);
-  while (running && !XNextEvent(dpy, &ev)) {
+  xfd = ConnectionNumber(dpy);
+  while (running) {
+    XFlush(dpy);
+    /* Find earliest pending rescale deadline across all clients. */
+    has_deadline = 0;
+    next.tv_sec = next.tv_nsec = 0;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    for (m = mons; m; m = m->next) {
+      for (c = m->clients; c; c = c->next) {
+        if (c->rescale_tries_left <= 0)
+          continue;
+        if (!has_deadline || timespec_cmp(&c->rescale_next, &next) < 0) {
+          next = c->rescale_next;
+          has_deadline = 1;
+        }
+      }
+    }
+    tvp = NULL;
+    if (has_deadline) {
+      sec = next.tv_sec - now.tv_sec;
+      nsec = next.tv_nsec - now.tv_nsec;
+      if (nsec < 0) { sec--; nsec += 1000000000L; }
+      if (sec < 0) { sec = 0; nsec = 0; }
+      tv.tv_sec = sec;
+      tv.tv_usec = nsec / 1000;
+      tvp = &tv;
+    }
+    if (!XPending(dpy)) {
+      FD_ZERO(&rfds);
+      FD_SET(xfd, &rfds);
+      pending = select(xfd + 1, &rfds, NULL, NULL, tvp);
+      if (pending < 0 && errno != EINTR)
+        break;
+      if (pending == 0) {
+        rescale_tick();
+        continue;
+      }
+    }
+    if (XNextEvent(dpy, &ev))
+      break;
     if (handler[ev.type])
       handler[ev.type](&ev); /* call handler */
+    rescale_tick();
     /* After alt-tab closes, regenerate all tagmaps on the next event.
      * By this point every app has had a full event-loop cycle to repaint,
      * so Imlib2 captures a clean screen with no overlay ghost. */
@@ -2072,6 +2250,56 @@ void scan(void) {
   }
 }
 
+/* snapglue: for each transient child of `parent` (c->glue_parent == parent),
+   position it flush against the right edge of parent's rendered content.
+   Content width is read from parent's WM_NORMAL_HINTS user_size; Qt updates
+   this value to the phone's native render width whenever dwm reflows the
+   tile cell, so we don't hardcode any skin dimensions. Transient is kept
+   raised so it never hides under siblings. */
+void snapglue(Client *parent) {
+  Client *c;
+  XSizeHints h;
+  long sup;
+  int cw, snap_x;
+
+  /* read parent's content width from WM_NORMAL_HINTS user_size. Qt may
+     briefly report the outer window size; ignore readings >= parent->w
+     so we don't fall back to snapping to the window edge. */
+  cw = 0;
+  if (XGetWMNormalHints(dpy, parent->win, &h, &sup) &&
+      (h.flags & USSize) && h.width > 0 && h.width < parent->w)
+    cw = h.width;
+  if (cw == 0)
+    return;
+  snap_x = parent->x + cw;
+  for (c = parent->mon->clients; c; c = c->next) {
+    if (c->glue_parent != parent)
+      continue;
+    XMoveResizeWindow(dpy, c->win, snap_x, parent->y, c->w, c->h);
+    c->x = snap_x;
+    c->y = parent->y;
+    XRaiseWindow(dpy, c->win);
+  }
+}
+
+/* bindglueparent: if c has WM_TRANSIENT_FOR pointing at a managed isglued
+   client (own window or a swallowed window), record the parent on c and
+   return 1. */
+int bindglueparent(Client *c) {
+  Window trans;
+  Client *t;
+
+  if (!XGetTransientForHint(dpy, c->win, &trans))
+    return 0;
+  t = wintoclient(trans);
+  if (!t)
+    t = swallowingclient(trans);
+  if (!t || !t->isglued)
+    return 0;
+  c->glue_parent = t;
+  return 1;
+}
+
 void sendmon(Client *c, Monitor *m) {
   if (c->mon == m)
     return;
@@ -2082,6 +2310,26 @@ void sendmon(Client *c, Monitor *m) {
   c->tags = m->tagset[m->seltags];
   attach(c);
   attachstack(c);
+  /* Carry the glued family along on monitor moves. */
+  if (c->isglued) {
+    Monitor *mn;
+    Client *ch, *next;
+    for (mn = mons; mn; mn = mn->next) {
+      for (ch = mn->clients; ch; ch = next) {
+        next = ch->next;
+        if (ch->glue_parent != c)
+          continue;
+        if (ch->mon != m) {
+          detach(ch);
+          detachstack(ch);
+          ch->mon = m;
+          attach(ch);
+          attachstack(ch);
+        }
+        ch->tags = m->tagset[m->seltags];
+      }
+    }
+  }
   selmon = m;      /* switch to target monitor */
   focus(c);        /* focus the sent client specifically */
   arrange(NULL);
@@ -2361,6 +2609,15 @@ void spawn(const Arg *arg) {
 void tag(const Arg *arg) {
   if (selmon->sel && arg->ui & TAGMASK) {
     selmon->sel->tags = arg->ui & TAGMASK;
+    /* Carry the glued family along on tag moves. */
+    if (selmon->sel->isglued) {
+      Monitor *mn;
+      Client *ch;
+      for (mn = mons; mn; mn = mn->next)
+        for (ch = mn->clients; ch; ch = ch->next)
+          if (ch->glue_parent == selmon->sel)
+            ch->tags = selmon->sel->tags;
+    }
     focus(NULL);
     arrange(selmon);
   }
@@ -2556,6 +2813,18 @@ void unfocus(Client *c, int setfocus) {
 void unmanage(Client *c, int destroyed) {
   Monitor *m = c->mon;
   XWindowChanges wc;
+
+  /* Drop glue pointers that reference this client so children don't
+     dangle. Children surviving beyond the parent just become ordinary
+     floaters until they die on their own (qemu unmaps them). */
+  if (c->isglued) {
+    Monitor *mn;
+    Client *ch;
+    for (mn = mons; mn; mn = mn->next)
+      for (ch = mn->clients; ch; ch = ch->next)
+        if (ch->glue_parent == c)
+          ch->glue_parent = NULL;
+  }
 
   if (c->swallowing) {
     unswallow(c);

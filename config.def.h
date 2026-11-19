@@ -83,13 +83,18 @@ static const Rule rules[] = {
      *	WM_NAME(STRING) = title
      */
     /* class     instance  title           tags mask  isfloating  isterminal
-       noswallow  monitor */
-    {"Gimp", NULL, NULL, 0, 1, 0, 0, -1},
-    {"Firefox", NULL, NULL, 1 << 8, 0, 0, -1, -1},
-    {"St", NULL, NULL, 0, 0, 1, 0, -1},
-    {"tabbed", NULL, NULL, 0, 0, 1, 0, -1},
-    {NULL, NULL, "Event Tester", 0, 0, 0, 1, -1}, /* xev */
-    {"dragon-drop", NULL, NULL, 0, 1, 0, 0, -1},
+       noswallow  monitor  isglued */
+    {"Gimp", NULL, NULL, 0, 1, 0, 0, -1, 0},
+    {"Firefox", NULL, NULL, 1 << 8, 0, 0, -1, -1, 0},
+    {"St", NULL, NULL, 0, 0, 1, 0, -1, 0},
+    {"tabbed", NULL, NULL, 0, 0, 1, 0, -1, 0},
+    {NULL, NULL, "Event Tester", 0, 0, 0, 1, -1, 0}, /* xev */
+    {"dragon-drop", NULL, NULL, 0, 1, 0, 0, -1, 0},
+    /* Android Emulator: VM window glued to its controls sidebar.
+       Class is "Emulator" (instance is "qemu-system-x86_64").
+       noswallow=1 keeps swallow from folding the VM into the launching st;
+       the launcher script detaches qemu from the terminal so this is safe. */
+    {"Emulator", NULL, NULL, 0, 0, 0, 1, -1, 1},
 };
 
 /* layout(s) */
